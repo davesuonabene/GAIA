@@ -1,58 +1,79 @@
-# GenMix (Project Gaia)
+# Gaia GenMix: Evolutionary Audio Mixing System
 
-GenMix is an evolutionary audio processing system that uses genetic algorithms to evolve multi-band mixing chains. It allows users to "breed" the perfect mix by selecting parent configurations and applying structural and parametric mutations.
+Gaia GenMix is an interactive, hierarchical genetic algorithm (IGA) designed for audio mixing. It allows users to evolve multi-band effects chains through a specialized Terminal User Interface (TUI). Instead of static presets, GenMix treats every mixing decision as a gene that can be drifted, locked, or mutated.
 
-## Core Architecture
+## 🏗 Hierarchical Architecture
 
-### 1. Evolutionary DNA (`core/`)
-- **`Parameter`**: The base unit of evolution. Holds value, bounds, and drift ranges. Supports locking to prevent further mutation.
-- **`AudioModule`**: Base class for DSP effects. Currently includes a `CompressorModule` with safe-spawning defaults.
-- **`Band`**: Manages a chain of `AudioModule`s for a specific frequency range. Handles structural mutations (adding/removing/swapping FX).
-- **`Mix`**: The top-level genotype. Manages multiple `Band` objects separated by crossover frequencies.
+The system is built on a 4-tier hierarchy:
 
-### 2. Audio Engine (`audio/`)
-- **`Crossover`**: A phase-accurate, mathematically transparent multi-band splitter. Uses a subtractive filter bank approach to ensure `Sum(Bands) == Input` with machine precision (`1e-16`).
-- **`Engine`**: Maps GenMix DNA to real-time DSP using the `pedalboard` library.
-- **`Analyzer`**: Provides fitness feedback using `librosa`. Extracts RMS (loudness), Transient Density (punch), and Spectral Centroid (brightness).
+1.  **Level 1: Mix (The Organism)**
+    *   Manages the global crossover frequencies and a collection of frequency bands.
+    *   DNA: `crossover_params` (sorted frequency points).
+2.  **Level 2: Band (The Chromosome)**
+    *   A specific frequency range (e.g., Low, Mid, High) containing a sequential effect chain.
+    *   Evolution: Structural mutations (add, remove, or swap effects).
+3.  **Level 3: AudioModule (The Gene Group)**
+    *   A DSP processor (Compressor, Expander, Transient Shaper).
+    *   DNA: A set of internal `Parameter` objects.
+4.  **Level 4: Parameter (The Gene)**
+    *   The atomic unit: Threshold, Ratio, Gain, etc.
+    *   DNA: Value, bounds, drift range, and a `is_locked` status.
 
-### 3. Genetic Algorithm (`ga/`)
-- **`Population`**: Manages a batch of `Mix` candidates. Handles cloning and the generation of new offspring from a selected parent.
+## 📁 Project Structure
 
-### 4. Interactive Interface (`cli.py`)
-A keyboard-driven TUI (Terminal User Interface) built with `rich` and `InquirerPy`.
-- View the current population in a color-coded table.
-- Select a "Parent" for the next generation.
-- Lock specific parameters to preserve "sweet spots."
-- Adjust mutation rates for structure and parameters.
-- Evolve and watch the DSP chains transform in real-time.
-
-## Installation
-
-```bash
-# Navigate to the project directory
-cd .openclaw/workspace/projects/gaia
-
-# Activate the virtual environment
-source venv/bin/bin/activate
-
-# Install dependencies (if not already handled by venv setup)
-pip install numpy scipy pedalboard librosa rich InquirerPy
+```text
+gaia/
+├── core/                  # Core Evolutionary Objects
+│   ├── parameter.py       # Level 4: Value bounds and mutation logic
+│   ├── audio_module.py    # Level 3: DSP units with safe-spawning
+│   ├── band.py           # Level 2: FX chain management & structural evolution
+│   └── mix.py            # Level 1: Global crossover and band coordination
+├── ga/                    # Genetic Algorithm Logic
+│   └── population.py      # Population management and next-gen spawning
+├── audio/                 # Audio Engine (DSP & Analysis)
+│   ├── analyzer.py        # Feature extraction (RMS, Transients, etc.)
+│   ├── crossover.py       # Phase-accurate Linkwitz-Riley splitting
+│   └── engine.py          # Pedalboard-based rendering
+└── cli.py                 # Miller Column TUI & Keyboard Handler
 ```
 
-## Usage
+## 🎮 Interactive TUI (cli.py)
 
-Launch the interactive evolution environment:
+The interface uses a **Miller Column** navigation system for deep-diving into the population's DNA.
+
+### Navigation Controls
+*   **Arrows (↑ / ↓)**: Move the cursor up and down within the current column.
+*   **Arrows (← / →)**: Navigate between hierarchy levels (Population → Mix Tree → Modules/XO → Params).
+*   **SPACE**: Toggle **LOCK** 🔒 on the selected parameter. Locked parameters will not mutate.
+*   **ENTER**:
+    *   At the **Population** level (far left): Evolve a new generation from the selected parent.
+    *   At the **Parameter** level (far right): Enter **Inline Edit** mode to type a specific value.
+*   **Plus (+) / Minus (-)**: Manually nudge a parameter value up or down.
+*   **ESC**: Cancel inline editing.
+*   **CTRL+C**: Exit the application.
+
+### Key Features
+*   **Safe-Spawning**: New modules are initialized with transparent settings (e.g., 1:1 ratio) to prevent audio surprises.
+*   **Cross-Platform Input**: Low-level keyboard listener optimized for Linux (unbuffered `os.read`) and Windows.
+*   **Real-time Feedback**: Color-coded columns show the path from the population down to the specific parameter.
+
+## 🚀 Getting Started
+
+1.  **Environment Setup**:
+    ```bash
+    cd .openclaw/workspace/projects/gaia
+    source venv/bin/activate
+    ```
+
+2.  **Launch the System**:
+    ```bash
+    # Run the interactive TUI
+    python cli.py
+    ```
+
+## 🧪 Testing
+Each module in `core/` and `audio/` contains a `__main__` block for unit testing.
 ```bash
-PYTHONPATH=. python cli.py
+python core/mix.py
+python core/parameter.py
 ```
-
-### Controls
-- **Select Parent**: Pick the mix configuration you like most.
-- **Lock Parameter**: Deep-dive into a module to freeze specific knobs.
-- **Evolve Next Gen**: Generate a new batch of 5 children based on your selection.
-
-## Testing & Verification
-Each module includes a standalone test block to verify its logic:
-- `core/parameter.py`: Test value drifting and locking.
-- `audio/crossover.py`: Verify mathematical transparency of the filter bank.
-- `audio/analyzer.py`: Confirm accurate detection of brightness and transients.
