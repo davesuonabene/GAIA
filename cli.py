@@ -1,6 +1,5 @@
 import sys
 import os
-import time
 from typing import List, Any
 
 # Ensure we can import from core and ga
@@ -8,48 +7,112 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from rich.live import Live
 from rich.panel import Panel
-from rich.layout import Layout
-from rich.console import Console, Group
+from rich.console import Group
 from rich.text import Text
+from rich.columns import Columns
+from rich.align import Align
 from rich import box
 
 from core.mix import Mix
 from ga.population import Population
 from core.audio_module import CompressorModule, ExpanderModule, TransientShaperModule
 
-# --- KEYBOARD LISTENER (Unix/Linux) ---
-import tty
-import termios
-
-def get_key():
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(sys.stdin.fileno())
-        ch = sys.stdin.read(1)
-        if ch == '\x1b': # Escape sequence
-            ch += sys.stdin.read(2)
-    except Exception:
-        return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
-
 # Key Constants
-KEY_UP = "\x1b[A"
-KEY_DOWN = "\x1b[B"
-KEY_RIGHT = "\x1b[C"
-KEY_LEFT = "\x1b[D"
-KEY_ENTER = "\r"
-KEY_CTRL_C = "\x03"
+KEY_UP = "UP"
+KEY_DOWN = "DOWN"
+KEY_RIGHT = "RIGHT"
+KEY_LEFT = "LEFT"
+KEY_ENTER = "ENTER"
+KEY_CTRL_C = "CTRL_C"
+KEY_ESC = "ESC"
+KEY_PLUS = "+"
+KEY_EQUAL = "="
+KEY_MINUS = "-"
+KEY_SPACE = " "
+KEY_BACKSPACE = "BACKSPACE"
+
+# --- KEYBOARD LISTENER (Cross-Platform) ---
+try:
+    import msvcrt
+    def get_key():
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b'\x00', b'\xe0'): # Arrow key prefix
+                ch2 = msvcrt.getch()
+                if ch2 == b'H': return KEY_UP
+                elif ch2 == b'P': return KEY_DOWN
+                elif ch2 == b'M': return KEY_RIGHT
+                elif ch2 == b'K': return KEY_LEFT
+            elif ch == b'\r': return KEY_ENTER
+            elif ch == b'\x03': return KEY_CTRL_C
+            elif ch == b'\x1b': return KEY_ESC
+            elif ch == b'\x08': return KEY_BACKSPACE
+            elif ch in (b'+', b'='): return KEY_PLUS
+            elif ch == b'-': return KEY_MINUS
+            elif ch == b' ': return KEY_SPACE
+            else:
+                try: return ch.decode('ascii')
+                except: return None
+        return None
+except ImportError:
+    import tty
+    import termios
+    import select
+    def get_key():
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            # Use os.read to avoid buffering issues with sys.stdin
+            ch_bytes = os.read(fd, 1)
+            if not ch_bytes:
+                return None
+            ch = ch_bytes.decode('ascii', errors='ignore')
+            
+            if ch == '\x1b': # Escape sequence
+                # Wait for the next byte to distinguish ESC key from Arrow keys
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if r:
+                    ch2 = os.read(fd, 1).decode('ascii', errors='ignore')
+                    if ch2 in ('[', 'O'):
+                        r2, _, _ = select.select([fd], [], [], 0.1)
+                        if r2:
+                            ch3 = os.read(fd, 1).decode('ascii', errors='ignore')
+                            if ch3 == 'A': return KEY_UP
+                            elif ch3 == 'B': return KEY_DOWN
+                            elif ch3 == 'C': return KEY_RIGHT
+                            elif ch3 == 'D': return KEY_LEFT
+                return KEY_ESC
+            elif ch == '\r': return KEY_ENTER
+            elif ch == '\x03': return KEY_CTRL_C
+            elif ch in ('\x08', '\x7f'): return KEY_BACKSPACE
+            elif ch == '=': return KEY_PLUS
+            elif ch == '-': return KEY_MINUS
+            elif ch == ' ': return KEY_SPACE
+            else:
+                return ch
+        except Exception:
+            return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 class GaiaTUI:
     def __init__(self, population: Population):
         self.population = population
-        self.depth = 0 # Current active column
+        self.depth = 0 # Current active column (0 to 3)
         self.indices = [0, 0, 0, 0] # Cursor position for each column
         self.running = True
-        self.status_msg = "Arrows to navigate | ENTER: Evolve (Col 0) or Toggle Lock (Col 2/3)"
+        
+        # Inline Editing State
+        self.editing = False
+        self.edit_buffer = ""
+        
+        self.status_msg = "Arrows: Navigate | SPACE: Lock | ENTER: Edit/Evolve | +/-: Adjust"
+
+    def _reset_child_indices(self):
+        """Resets the indices for all columns deeper than the current active column."""
+        for i in range(self.depth + 1, 4):
+            self.indices[i] = 0
 
     def get_column_data(self, depth: int) -> List[Any]:
         """Returns the list of objects for a specific Miller Column."""
@@ -57,25 +120,22 @@ class GaiaTUI:
             if depth == 0:
                 return self.population.mixes
             
-            # Column 1 depends on Selected Mix (Col 0)
             mix = self.population.mixes[self.indices[0]]
             if depth == 1:
                 return ["Crossovers"] + mix.bands
             
-            # Column 2 depends on Selected Mix (Col 0) and Selected Branch (Col 1)
             tree_items = ["Crossovers"] + mix.bands
             branch = tree_items[self.indices[1]]
             
             if depth == 2:
                 if branch == "Crossovers":
                     return mix.crossover_params
-                else: # It's a Band
+                else: 
                     return branch.modules
                 
-            # Column 3 depends on Selected Module (Col 2)
             if depth == 3:
                 if branch == "Crossovers":
-                    return [] # No 4th level for crossovers
+                    return [] 
                 modules = branch.modules
                 if not modules: return []
                 module = modules[self.indices[2]]
@@ -86,56 +146,130 @@ class GaiaTUI:
         return []
 
     def navigate(self, key: str):
-        # 1. Update index for current column
+        if not key:
+            return
+            
+        # If we are currently INLINE EDITING a parameter:
+        if self.editing:
+            if key == KEY_ENTER:
+                try:
+                    new_val = float(self.edit_buffer)
+                    self.set_value_directly(new_val)
+                except ValueError:
+                    self.status_msg = "Invalid number. Edit cancelled."
+                self.editing = False
+                self.edit_buffer = ""
+            elif key == KEY_ESC:
+                self.editing = False
+                self.edit_buffer = ""
+                self.status_msg = "Edit cancelled."
+            elif key == KEY_BACKSPACE:
+                self.edit_buffer = self.edit_buffer[:-1]
+            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+                self.edit_buffer += key
+            return
+
+        # Normal Navigation Logic
         items = self.get_column_data(self.depth)
         
         if key == KEY_UP:
-            if items:
+            if len(items) > 0:
                 self.indices[self.depth] = (self.indices[self.depth] - 1) % len(items)
+                self._reset_child_indices()
         elif key == KEY_DOWN:
-            if items:
+            if len(items) > 0:
                 self.indices[self.depth] = (self.indices[self.depth] + 1) % len(items)
+                self._reset_child_indices()
         elif key == KEY_LEFT:
             if self.depth > 0:
                 self.depth -= 1
+                self._reset_child_indices()
         elif key == KEY_RIGHT:
-            # Check if next level has data
             if self.depth < 3:
                 next_items = self.get_column_data(self.depth + 1)
-                if next_items:
+                if len(next_items) > 0:
                     self.depth += 1
-                    # Ensure child index is valid
                     if self.indices[self.depth] >= len(next_items):
                         self.indices[self.depth] = 0
         elif key == KEY_ENTER:
             self.execute_action()
+        elif key == KEY_SPACE:
+            self.toggle_lock()
+        elif key == KEY_PLUS:
+            self.adjust_value(1)
+        elif key == KEY_MINUS:
+            self.adjust_value(-1)
         elif key == KEY_CTRL_C:
             self.running = False
+
+    def get_selected_param(self) -> Any:
+        """Returns the currently selected Parameter object, or None if not at a parameter level."""
+        if self.depth == 2:
+            items = self.get_column_data(2)
+            if items and self.indices[1] == 0: # Crossovers branch
+                return items[self.indices[2]]
+        elif self.depth == 3:
+            items = self.get_column_data(3)
+            if items:
+                return items[self.indices[3]]
+        return None
+
+    def toggle_lock(self):
+        """Toggles the lock status of the currently selected parameter."""
+        param = self.get_selected_param()
+        if param:
+            param.is_locked = not param.is_locked
+            self.status_msg = f"Toggled Lock: {param.name} is now {'LOCKED' if param.is_locked else 'FREE'}"
+
+    def set_value_directly(self, new_val: float):
+        """Sets the value of the selected parameter, respecting bounds."""
+        param = self.get_selected_param()
+        if param:
+            param.current_value = max(param.min_bound, min(param.max_bound, new_val))
+            self.status_msg = f"Set {param.name} to {param.current_value:.2f}"
+            
+            # If it's a crossover, resort and rename to maintain logic, and update cursor
+            if self.depth == 2 and self.indices[1] == 0:
+                mix = self.population.mixes[self.indices[0]]
+                mix.sort_crossovers()
+                self.indices[2] = mix.crossover_params.index(param)
+
+    def adjust_value(self, direction: int):
+        """Manually steps a selected parameter's value up or down."""
+        param = self.get_selected_param()
+        if not param:
+            return
+            
+        if self.depth == 2: # Crossover
+            step = (param.max_bound - param.min_bound) * 0.02 * direction
+        else: # Module param
+            step = (param.max_bound - param.min_bound) * 0.05 * direction
+            
+        new_val = param.current_value + step
+        param.current_value = max(param.min_bound, min(param.max_bound, new_val))
+        self.status_msg = f"Adjusted {param.name} to {param.current_value:.2f}"
+        
+        if self.depth == 2 and self.indices[1] == 0:
+            mix = self.population.mixes[self.indices[0]]
+            mix.sort_crossovers()
+            self.indices[2] = mix.crossover_params.index(param)
 
     def execute_action(self):
         """Action logic for Enter key."""
         if self.depth == 0:
             # Evolve whole population from this parent
             self.population.generate_next_generation(self.indices[0], 0.5, 0.5)
+            self._reset_child_indices()
             self.status_msg = f"Evolved generation {self.population.generation_count} from Mix {self.indices[0]}!"
-        
-        elif self.depth == 2:
-            # Toggle Lock on Crossover
-            items = self.get_column_data(2)
-            if items and self.indices[1] == 0: # Crossovers branch
-                param = items[self.indices[2]]
-                param.is_locked = not param.is_locked
-                self.status_msg = f"Toggled Lock: {param.name} is now {'LOCKED' if param.is_locked else 'FREE'}"
-        
-        elif self.depth == 3:
-            # Toggle Lock on Module Parameter
-            items = self.get_column_data(3)
-            if items:
-                param = items[self.indices[3]]
-                param.is_locked = not param.is_locked
-                self.status_msg = f"Toggled Lock: {param.name} is now {'LOCKED' if param.is_locked else 'FREE'}"
+        elif self.depth in (2, 3):
+            param = self.get_selected_param()
+            if param:
+                # Start inline editing
+                self.editing = True
+                self.edit_buffer = str(round(param.current_value, 2))
+                self.status_msg = f"Editing {param.name} (Min: {param.min_bound}, Max: {param.max_bound}). ENTER to confirm, ESC to cancel."
 
-    def render_panel(self, depth: int, title: str) -> Panel:
+    def render_column_content(self, depth: int) -> Group:
         items = self.get_column_data(depth)
         is_active_col = (self.depth == depth)
         
@@ -147,70 +281,78 @@ class GaiaTUI:
             elif depth == 1: label = item if isinstance(item, str) else f"Band: {item.name}"
             elif depth == 2:
                 if self.indices[1] == 0: # Crossovers
-                    label = f"{item.name}: {item.current_value:.1f} Hz"
+                    if self.editing and is_active_col and i == self.indices[depth]:
+                        label = f"{item.name}: {self.edit_buffer} Hz █"
+                    else:
+                        label = f"{item.name}: {item.current_value:.1f} Hz"
                 else: # Modules
                     label = f"[{i}] {item.name}"
             elif depth == 3: # Module Params
-                label = f"{item.name}: {item.current_value:7.2f}"
+                if self.editing and is_active_col and i == self.indices[depth]:
+                    label = f"{item.name}: {self.edit_buffer} █"
+                else:
+                    label = f"{item.name}: {item.current_value:7.2f}"
 
             # 2. Status Indicators
             locked = " 🔒" if getattr(item, 'is_locked', False) else ""
             
             # 3. Styling
             text_style = "white"
+            prefix = "  "
             if i == self.indices[depth]:
                 if is_active_col:
-                    text_style = "bold white on blue"
-                    label = f"▶ {label}"
+                    if self.editing:
+                        text_style = "bold black on yellow"
+                    else:
+                        text_style = "bold white on blue"
+                    prefix = "▶ "
                 else:
-                    text_style = "bold yellow" # Path highlight
-                    label = f"  {label}"
-            else:
-                label = f"  {label}"
+                    text_style = "bold grey74" # Path highlight
+                    prefix = "  "
 
-            content.append(Text(f"{label}{locked}", style=text_style))
+            content.append(Text(f"{prefix}{label}{locked}", style=text_style))
 
         if not items:
             content.append(Text("  (None)", style="dim"))
 
-        border_style = "cyan" if is_active_col else "white"
-        return Panel(Group(*content), title=f"[bold]{title}[/bold]", border_style=border_style, padding=(1, 1))
+        return Group(*content)
 
 def main():
-    # Setup initial population
-    initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0]) for _ in range(5)]
+    # Setup initial population (4 crossovers = 5 bands)
+    initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0, 8000.0]) for _ in range(5)]
     for m in initial_mixes:
         m.bands[0].modules.append(CompressorModule())
         m.bands[1].modules.append(TransientShaperModule())
         m.bands[2].modules.append(ExpanderModule())
+        m.bands[3].modules.append(CompressorModule())
+        m.bands[4].modules.append(TransientShaperModule())
 
     pop = Population(initial_mixes)
     tui = GaiaTUI(pop)
-    
-    # Setup Layout
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="body"),
-        Layout(name="footer", size=3)
-    )
-    layout["body"].split_row(
-        Layout(name="c0"), Layout(name="c1"), Layout(name="c2"), Layout(name="c3")
-    )
 
-    with Live(layout, refresh_per_second=20, screen=True):
+    with Live(auto_refresh=False, screen=True) as live:
         while tui.running:
-            # Update Header
-            layout["header"].update(Panel(Text(f"GAIA EVOLUTION SYSTEM | Gen {pop.generation_count}", justify="center", style="bold magenta"), box=box.SIMPLE))
+            # 1. Header
+            header = Panel(
+                Align.center(f"[bold magenta]GAIA EVOLUTION SYSTEM | Gen {pop.generation_count}[/bold magenta]"), 
+                box=box.DOUBLE
+            )
             
-            # Update Body
-            layout["c0"].update(tui.render_panel(0, "Population"))
-            layout["c1"].update(tui.render_panel(1, "Mix Tree"))
-            layout["c2"].update(tui.render_panel(2, "Modules/XO"))
-            layout["c3"].update(tui.render_panel(3, "Params"))
+            # 2. Miller Columns
+            c0 = Panel(tui.render_column_content(0), title="[bold]Population[/bold]", border_style="cyan" if tui.depth == 0 else "dim")
+            c1 = Panel(tui.render_column_content(1), title="[bold]Mix Tree[/bold]", border_style="cyan" if tui.depth == 1 else "dim")
+            c2 = Panel(tui.render_column_content(2), title="[bold]Modules/XO[/bold]", border_style="cyan" if tui.depth == 2 else "dim")
+            c3 = Panel(tui.render_column_content(3), title="[bold]Params[/bold]", border_style="cyan" if tui.depth == 3 else "dim")
             
-            # Update Footer
-            layout["footer"].update(Panel(Text(tui.status_msg, style="italic green"), box=box.SIMPLE))
+            columns = Columns([c0, c1, c2, c3], expand=True)
+            
+            # 3. Footer
+            footer_style = "bold yellow" if tui.editing else "italic green"
+            footer = Panel(Text(tui.status_msg, style=footer_style), box=box.SIMPLE)
+            
+            # Assemble & Render
+            renderable = Group(header, columns, footer)
+            live.update(renderable, refresh=True)
             
             # Input
             key = get_key()

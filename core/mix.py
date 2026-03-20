@@ -45,14 +45,20 @@ class Mix:
         """Alias for crossover_frequencies to maintain compatibility with the engine."""
         return self.crossover_frequencies
 
+    def sort_crossovers(self) -> None:
+        """Sorts the crossover parameters by frequency and updates their names to maintain logical order."""
+        self.crossover_params.sort(key=lambda p: p.current_value)
+        for i, p in enumerate(self.crossover_params):
+            p.name = f"Crossover {i+1}"
+
     def evolve(self, structural_mutation_rate: float = 0.5, parametric_mutation_rate: float = 0.5) -> None:
         """Evolves the mix by applying structural and parameter mutations."""
         # 1. Mutate crossover frequencies
         for p in self.crossover_params:
             p.mutate(parametric_mutation_rate)
         
-        # Sort crossover parameters by their current value to maintain band order
-        self.crossover_params.sort(key=lambda p: p.current_value)
+        # Sort and rename crossover parameters to maintain band order
+        self.sort_crossovers()
         
         # 2. Mutate bands
         for band in self.bands:
