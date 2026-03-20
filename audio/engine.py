@@ -1,13 +1,18 @@
 import numpy as np
 import pedalboard
 from typing import List
+import sys
+import os
 
 try:
     from .crossover import Crossover
     from ..core.mix import Mix
     from ..core.audio_module import CompressorModule
 except (ImportError, ValueError):
-    from crossover import Crossover
+    try:
+        from audio.crossover import Crossover
+    except ImportError:
+        from crossover import Crossover
     from core.mix import Mix
     from core.audio_module import CompressorModule
 

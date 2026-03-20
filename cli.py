@@ -1,5 +1,9 @@
 import sys
 import os
+import argparse
+import numpy as np
+import soundfile as sf
+import sounddevice as sd
 from typing import List, Any
 
 # Ensure we can import from core and ga
@@ -16,6 +20,7 @@ from rich import box
 from core.mix import Mix
 from ga.population import Population
 from core.audio_module import CompressorModule, ExpanderModule, TransientShaperModule
+from audio.engine import Engine
 
 # Key Constants
 KEY_UP = "UP"
@@ -30,6 +35,8 @@ KEY_EQUAL = "="
 KEY_MINUS = "-"
 KEY_SPACE = " "
 KEY_BACKSPACE = "BACKSPACE"
+KEY_E = "E"
+KEY_P = "P"
 
 # --- KEYBOARD LISTENER (Cross-Platform) ---
 try:
@@ -50,6 +57,8 @@ try:
             elif ch in (b'+', b'='): return KEY_PLUS
             elif ch == b'-': return KEY_MINUS
             elif ch == b' ': return KEY_SPACE
+            elif ch in (b'e', b'E'): return KEY_E
+            elif ch in (b'p', b'P'): return KEY_P
             else:
                 try: return ch.decode('ascii')
                 except: return None
@@ -89,6 +98,8 @@ except ImportError:
             elif ch == '=': return KEY_PLUS
             elif ch == '-': return KEY_MINUS
             elif ch == ' ': return KEY_SPACE
+            elif ch in ('e', 'E'): return KEY_E
+            elif ch in ('p', 'P'): return KEY_P
             else:
                 return ch
         except Exception:
@@ -97,17 +108,26 @@ except ImportError:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 class GaiaTUI:
-    def __init__(self, population: Population):
+    def __init__(self, population: Population, audio_data: np.ndarray, sample_rate: int, output_dir: str):
         self.population = population
+        self.audio_data = audio_data
+        self.sample_rate = sample_rate
+        self.output_dir = output_dir
         self.depth = 0 # Current active column (0 to 3)
         self.indices = [0, 0, 0, 0] # Cursor position for each column
         self.running = True
+        self.engine = Engine(sample_rate=self.sample_rate)
+        self.is_playing = False
         
         # Inline Editing State
         self.editing = False
         self.edit_buffer = ""
         
-        self.status_msg = "Arrows: Navigate | SPACE: Lock | ENTER: Edit/Evolve | +/-: Adjust"
+        self.status_msg = "Arrows: Navigate | SPACE: Lock | ENTER: Edit/Evolve | +/-: Adjust | E: Export | P: Play/Stop"
+
+    def process_current_mix(self) -> np.ndarray:
+        mix = self.population.mixes[self.indices[0]]
+        return self.engine.process(self.audio_data, mix)
 
     def _reset_child_indices(self):
         """Resets the indices for all columns deeper than the current active column."""
@@ -201,6 +221,30 @@ class GaiaTUI:
             self.adjust_value(-1)
         elif key == KEY_CTRL_C:
             self.running = False
+        elif key == KEY_E:
+            self.status_msg = f"Exporting Mix {self.indices[0]}..."
+            try:
+                processed_audio = self.process_current_mix()
+                os.makedirs(self.output_dir, exist_ok=True)
+                filename = os.path.join(self.output_dir, f"gen_{self.population.generation_count}_mix_{self.indices[0]}.wav")
+                sf.write(filename, processed_audio.T, self.sample_rate)
+                self.status_msg = f"Exported to {filename}!"
+            except Exception as e:
+                self.status_msg = f"Export failed: {e}"
+        elif key == KEY_P:
+            if self.is_playing:
+                sd.stop()
+                self.is_playing = False
+                self.status_msg = "Playback stopped."
+            else:
+                self.status_msg = "Processing audio for playback..."
+                try:
+                    processed_audio = self.process_current_mix()
+                    sd.play(processed_audio.T, self.sample_rate)
+                    self.is_playing = True
+                    self.status_msg = "Playing mix..."
+                except Exception as e:
+                    self.status_msg = f"Playback failed: {e}"
 
     def get_selected_param(self) -> Any:
         """Returns the currently selected Parameter object, or None if not at a parameter level."""
@@ -318,6 +362,34 @@ class GaiaTUI:
         return Group(*content)
 
 def main():
+    parser = argparse.ArgumentParser(description="GenMix Gaia TUI")
+    parser.add_argument("input_file", type=str, nargs="?", help="Path to the input audio file")
+    parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output files")
+    args = parser.parse_args()
+
+    input_file = args.input_file
+    if not input_file:
+        while True:
+            try:
+                input_file = input("Enter path to input audio file: ").strip()
+                if os.path.isfile(input_file):
+                    break
+                print(f"Error: File '{input_file}' not found. Please try again.")
+            except (KeyboardInterrupt, EOFError):
+                print("\nExited Gaia.")
+                sys.exit(0)
+
+    try:
+        audio_data, sample_rate = sf.read(input_file)
+        # soundfile returns (samples, channels). pedalboard needs (channels, samples).
+        if audio_data.ndim == 1:
+            audio_data = audio_data.reshape(1, -1)
+        else:
+            audio_data = audio_data.T
+    except Exception as e:
+        print(f"Error loading audio file: {e}")
+        sys.exit(1)
+
     # Setup initial population (4 crossovers = 5 bands)
     initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0, 8000.0]) for _ in range(5)]
     for m in initial_mixes:
@@ -328,7 +400,7 @@ def main():
         m.bands[4].modules.append(TransientShaperModule())
 
     pop = Population(initial_mixes)
-    tui = GaiaTUI(pop)
+    tui = GaiaTUI(pop, audio_data, sample_rate, args.output_dir)
 
     with Live(auto_refresh=False, screen=True) as live:
         while tui.running:
