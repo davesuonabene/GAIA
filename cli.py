@@ -1,159 +1,225 @@
 import sys
 import os
-from typing import List
+import time
+from typing import List, Any
 
-# Ensure we can import from the core and ga directories
+# Ensure we can import from core and ga
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from rich.console import Console
-from rich.table import Table
+from rich.live import Live
 from rich.panel import Panel
+from rich.layout import Layout
+from rich.console import Console, Group
+from rich.text import Text
 from rich import box
-from InquirerPy import inquirer
-from InquirerPy.base.control import Choice
 
 from core.mix import Mix
-from core.audio_module import CompressorModule
 from ga.population import Population
+from core.audio_module import CompressorModule, ExpanderModule, TransientShaperModule
 
-class GenMixCLI:
-    def __init__(self):
-        self.console = Console()
-        # Initialize with 5 mixes
-        initial_mixes = [Mix(crossovers=[150.0, 2500.0]) for _ in range(5)]
-        # Seed them with some initial FX
-        for m in initial_mixes:
-            m.bands[0].modules.append(CompressorModule())
-            m.bands[1].modules.append(CompressorModule())
+# --- KEYBOARD LISTENER (Unix/Linux) ---
+import tty
+import termios
+
+def get_key():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+        if ch == '\x1b': # Escape sequence
+            ch += sys.stdin.read(2)
+    except Exception:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+# Key Constants
+KEY_UP = "\x1b[A"
+KEY_DOWN = "\x1b[B"
+KEY_RIGHT = "\x1b[C"
+KEY_LEFT = "\x1b[D"
+KEY_ENTER = "\r"
+KEY_CTRL_C = "\x03"
+
+class GaiaTUI:
+    def __init__(self, population: Population):
+        self.population = population
+        self.depth = 0 # Current active column
+        self.indices = [0, 0, 0, 0] # Cursor position for each column
+        self.running = True
+        self.status_msg = "Arrows to navigate | ENTER: Evolve (Col 0) or Toggle Lock (Col 2/3)"
+
+    def get_column_data(self, depth: int) -> List[Any]:
+        """Returns the list of objects for a specific Miller Column."""
+        try:
+            if depth == 0:
+                return self.population.mixes
             
-        self.population = Population(initial_mixes)
-        self.structural_rate = 0.5
-        self.parametric_rate = 0.5
-        self.parent_index = 0
-
-    def display_population(self):
-        self.console.clear()
-        self.console.print(Panel.fit(
-            f"[bold cyan]GenMix Evolution System[/bold cyan]\n"
-            f"Generation: [yellow]{self.population.generation_count}[/yellow] | "
-            f"Parent Index: [green]{self.parent_index}[/green]\n"
-            f"Structural Rate: [magenta]{self.structural_rate}[/magenta] | "
-            f"Parametric Rate: [magenta]{self.parametric_rate}[/magenta]",
-            box=box.DOUBLE_EDGE, border_style="blue"
-        ))
-
-        table = Table(title="Current Population", box=box.ROUNDED, expand=True)
-        table.add_column("ID", justify="center", style="cyan", no_wrap=True)
-        table.add_column("Low Band", style="green")
-        table.add_column("Mid Band", style="yellow")
-        table.add_column("High Band", style="red")
-
-        for i, mix in enumerate(self.population.mixes):
-            row_style = "bold white on grey15" if i == self.parent_index else ""
+            # Column 1 depends on Selected Mix (Col 0)
+            mix = self.population.mixes[self.indices[0]]
+            if depth == 1:
+                return ["Crossovers"] + mix.bands
             
-            # Format band info
-            band_info = []
-            for band in mix.bands:
-                if not band.modules:
-                    band_info.append("[grey50]Empty[/grey50]")
+            # Column 2 depends on Selected Mix (Col 0) and Selected Branch (Col 1)
+            tree_items = ["Crossovers"] + mix.bands
+            branch = tree_items[self.indices[1]]
+            
+            if depth == 2:
+                if branch == "Crossovers":
+                    return mix.crossover_params
+                else: # It's a Band
+                    return branch.modules
+                
+            # Column 3 depends on Selected Module (Col 2)
+            if depth == 3:
+                if branch == "Crossovers":
+                    return [] # No 4th level for crossovers
+                modules = branch.modules
+                if not modules: return []
+                module = modules[self.indices[2]]
+                return list(module.parameters.values())
+                
+        except (IndexError, AttributeError):
+            return []
+        return []
+
+    def navigate(self, key: str):
+        # 1. Update index for current column
+        items = self.get_column_data(self.depth)
+        
+        if key == KEY_UP:
+            if items:
+                self.indices[self.depth] = (self.indices[self.depth] - 1) % len(items)
+        elif key == KEY_DOWN:
+            if items:
+                self.indices[self.depth] = (self.indices[self.depth] + 1) % len(items)
+        elif key == KEY_LEFT:
+            if self.depth > 0:
+                self.depth -= 1
+        elif key == KEY_RIGHT:
+            # Check if next level has data
+            if self.depth < 3:
+                next_items = self.get_column_data(self.depth + 1)
+                if next_items:
+                    self.depth += 1
+                    # Ensure child index is valid
+                    if self.indices[self.depth] >= len(next_items):
+                        self.indices[self.depth] = 0
+        elif key == KEY_ENTER:
+            self.execute_action()
+        elif key == KEY_CTRL_C:
+            self.running = False
+
+    def execute_action(self):
+        """Action logic for Enter key."""
+        if self.depth == 0:
+            # Evolve whole population from this parent
+            self.population.generate_next_generation(self.indices[0], 0.5, 0.5)
+            self.status_msg = f"Evolved generation {self.population.generation_count} from Mix {self.indices[0]}!"
+        
+        elif self.depth == 2:
+            # Toggle Lock on Crossover
+            items = self.get_column_data(2)
+            if items and self.indices[1] == 0: # Crossovers branch
+                param = items[self.indices[2]]
+                param.is_locked = not param.is_locked
+                self.status_msg = f"Toggled Lock: {param.name} is now {'LOCKED' if param.is_locked else 'FREE'}"
+        
+        elif self.depth == 3:
+            # Toggle Lock on Module Parameter
+            items = self.get_column_data(3)
+            if items:
+                param = items[self.indices[3]]
+                param.is_locked = not param.is_locked
+                self.status_msg = f"Toggled Lock: {param.name} is now {'LOCKED' if param.is_locked else 'FREE'}"
+
+    def render_panel(self, depth: int, title: str) -> Panel:
+        items = self.get_column_data(depth)
+        is_active_col = (self.depth == depth)
+        
+        content = []
+        for i, item in enumerate(items):
+            # 1. Determine Label
+            label = ""
+            if depth == 0: label = f"Mix {i}"
+            elif depth == 1: label = item if isinstance(item, str) else f"Band: {item.name}"
+            elif depth == 2:
+                if self.indices[1] == 0: # Crossovers
+                    label = f"{item.name}: {item.current_value:.1f} Hz"
+                else: # Modules
+                    label = f"[{i}] {item.name}"
+            elif depth == 3: # Module Params
+                label = f"{item.name}: {item.current_value:7.2f}"
+
+            # 2. Status Indicators
+            locked = " 🔒" if getattr(item, 'is_locked', False) else ""
+            
+            # 3. Styling
+            text_style = "white"
+            if i == self.indices[depth]:
+                if is_active_col:
+                    text_style = "bold white on blue"
+                    label = f"▶ {label}"
                 else:
-                    chain = " -> ".join([m.name for m in band.modules])
-                    band_info.append(chain)
+                    text_style = "bold yellow" # Path highlight
+                    label = f"  {label}"
+            else:
+                label = f"  {label}"
+
+            content.append(Text(f"{label}{locked}", style=text_style))
+
+        if not items:
+            content.append(Text("  (None)", style="dim"))
+
+        border_style = "cyan" if is_active_col else "white"
+        return Panel(Group(*content), title=f"[bold]{title}[/bold]", border_style=border_style, padding=(1, 1))
+
+def main():
+    # Setup initial population
+    initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0]) for _ in range(5)]
+    for m in initial_mixes:
+        m.bands[0].modules.append(CompressorModule())
+        m.bands[1].modules.append(TransientShaperModule())
+        m.bands[2].modules.append(ExpanderModule())
+
+    pop = Population(initial_mixes)
+    tui = GaiaTUI(pop)
+    
+    # Setup Layout
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="body"),
+        Layout(name="footer", size=3)
+    )
+    layout["body"].split_row(
+        Layout(name="c0"), Layout(name="c1"), Layout(name="c2"), Layout(name="c3")
+    )
+
+    with Live(layout, refresh_per_second=20, screen=True):
+        while tui.running:
+            # Update Header
+            layout["header"].update(Panel(Text(f"GAIA EVOLUTION SYSTEM | Gen {pop.generation_count}", justify="center", style="bold magenta"), box=box.SIMPLE))
             
-            table.add_row(
-                str(i),
-                band_info[0],
-                band_info[1],
-                band_info[2],
-                style=row_style
-            )
-
-        self.console.print(table)
-
-    def select_parent(self):
-        choices = [Choice(i, name=f"Mix {i}") for i in range(len(self.population.mixes))]
-        self.parent_index = inquirer.select(
-            message="Select parent for next generation:",
-            choices=choices,
-            default=self.parent_index
-        ).execute()
-
-    def set_rates(self):
-        self.structural_rate = float(inquirer.text(
-            message="Set structural mutation rate (0.0 - 1.0):",
-            default=str(self.structural_rate),
-            validate=lambda x: 0.0 <= float(x) <= 1.0
-        ).execute())
-        self.parametric_rate = float(inquirer.text(
-            message="Set parametric mutation rate (0.0 - 1.0):",
-            default=str(self.parametric_rate),
-            validate=lambda x: 0.0 <= float(x) <= 1.0
-        ).execute())
-
-    def lock_parameters_menu(self):
-        # Nested menu to lock/unlock parameters of the selected parent
-        parent = self.population.mixes[self.parent_index]
-        
-        band_choices = [Choice(i, name=f"Band: {band.name}") for i, band in enumerate(parent.bands)]
-        band_choices.append(Choice(None, name="[Back]"))
-        
-        band_idx = inquirer.select(message="Select band:", choices=band_choices).execute()
-        if band_idx is None: return
-
-        modules = parent.bands[band_idx].modules
-        if not modules:
-            self.console.print("[red]No modules in this band.[/red]")
-            return
-
-        mod_choices = [Choice(i, name=f"Module: {m.name}") for i, m in enumerate(modules)]
-        mod_choices.append(Choice(None, name="[Back]"))
-        
-        mod_idx = inquirer.select(message="Select module:", choices=mod_choices).execute()
-        if mod_idx is None: return
-
-        params = modules[mod_idx].parameters
-        param_choices = []
-        for p_name, p in params.items():
-            status = "LOCKED" if p.is_locked else "Unlocked"
-            param_choices.append(Choice(p_name, name=f"{p_name} ({status})"))
-        
-        param_choices.append(Choice(None, name="[Back]"))
-        
-        p_name = inquirer.select(message="Toggle lock on parameter:", choices=param_choices).execute()
-        if p_name:
-            params[p_name].is_locked = not params[p_name].is_locked
-            self.console.print(f"[green]Toggled {p_name}.[/green]")
-
-    def run(self):
-        while True:
-            self.display_population()
-            action = inquirer.select(
-                message="Main Menu:",
-                choices=[
-                    "Evolve Next Gen",
-                    "Select Parent",
-                    "Lock Parameter",
-                    "Set Mutation Rates",
-                    "Exit"
-                ]
-            ).execute()
-
-            if action == "Exit":
-                break
-            elif action == "Select Parent":
-                self.select_parent()
-            elif action == "Set Mutation Rates":
-                self.set_rates()
-            elif action == "Evolve Next Gen":
-                self.population.generate_next_generation(
-                    self.parent_index, 
-                    self.structural_rate, 
-                    self.parametric_rate
-                )
-                self.console.print("[bold green]Evolved![/bold green]")
-            elif action == "Lock Parameter":
-                self.lock_parameters_menu()
+            # Update Body
+            layout["c0"].update(tui.render_panel(0, "Population"))
+            layout["c1"].update(tui.render_panel(1, "Mix Tree"))
+            layout["c2"].update(tui.render_panel(2, "Modules/XO"))
+            layout["c3"].update(tui.render_panel(3, "Params"))
+            
+            # Update Footer
+            layout["footer"].update(Panel(Text(tui.status_msg, style="italic green"), box=box.SIMPLE))
+            
+            # Input
+            key = get_key()
+            if key:
+                tui.navigate(key)
 
 if __name__ == "__main__":
-    cli = GenMixCLI()
-    cli.run()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    print("\nExited Gaia.")

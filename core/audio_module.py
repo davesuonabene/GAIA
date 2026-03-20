@@ -35,18 +35,31 @@ class CompressorModule(AudioModule):
         self.add_parameter(Parameter("Release", 100.0, 1.0, 2000.0, 10.0))
         self.add_parameter(Parameter("Gain", 0.0, -12.0, 24.0, 5.0))
 
+class ExpanderModule(AudioModule):
+    """An Expander module implementation."""
+    def __init__(self):
+        super().__init__("Expander")
+        # Safe-spawn defaults (transparent)
+        self.add_parameter(Parameter("Threshold", -80.0, -80.0, 0.0, 10.0))
+        self.add_parameter(Parameter("Ratio", 1.0, 1.0, 10.0, 5.0))
+        self.add_parameter(Parameter("Attack", 10.0, 0.1, 100.0, 10.0))
+        self.add_parameter(Parameter("Release", 100.0, 10.0, 1000.0, 10.0))
+
+class TransientShaperModule(AudioModule):
+    """A Transient Shaper module implementation."""
+    def __init__(self):
+        super().__init__("TransientShaper")
+        # Safe-spawn defaults (transparent)
+        self.add_parameter(Parameter("Attack Boost", 0.0, -100.0, 100.0, 15.0))
+        self.add_parameter(Parameter("Sustain Boost", 0.0, -100.0, 100.0, 15.0))
+
 if __name__ == "__main__":
-    # 1. Instantiate the Compressor
+    # --- SAFE SPAWN VERIFICATION ---
+    print("=== INITIAL SAFE-SPAWN STATES (DNA TRANSPARENCY) ===")
+    
     comp = CompressorModule()
+    exp = ExpanderModule()
+    ts = TransientShaperModule()
     
-    # 2. Lock the Ratio parameter
-    if "Ratio" in comp.parameters:
-        comp.parameters["Ratio"].is_locked = True
-    
-    print(f"--- INITIAL STATE ---\n{comp}")
-    
-    # 3. Run a loop of 5 mutations
-    for i in range(1, 6):
-        comp.mutate_parameters()
-        print(f"\n--- MUTATION #{i} ---")
-        print(comp)
+    for module in [comp, exp, ts]:
+        print(f"\n{module}")
