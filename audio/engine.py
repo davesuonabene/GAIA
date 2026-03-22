@@ -33,39 +33,23 @@ class Engine:
         for i, band_dna in enumerate(mix_dna.bands):
             band_audio = bands_audio[i]
             
-            # Map Band DNA to a Pedalboard chain
-            chain = []
+            # Process band audio through each module's process() method
+            current_audio = band_audio
             for module in band_dna.modules:
-                pb_module = self._map_module(module)
-                if pb_module:
-                    chain.append(pb_module)
+                current_audio = module.process(current_audio, self.sample_rate)
             
-            # Create a Pedalboard and process the band audio
-            if chain:
-                board = pedalboard.Pedalboard(chain)
-                processed_band = board.process(band_audio, self.sample_rate)
-                processed_bands.append(processed_band)
-            else:
-                processed_bands.append(band_audio)
+            processed_bands.append(current_audio)
                 
         # 3. Sum the processed bands back together
-        return crossover.sum_bands(processed_bands)
+        summed_audio = crossover.sum_bands(processed_bands)
+        
+        # 4. Final Limiter to prevent clipping
+        if pedalboard:
+            limiter = pedalboard.Limiter(threshold_db=-0.1)
+            return limiter.process(summed_audio, self.sample_rate)
+        
+        return summed_audio
 
-    def _map_module(self, module):
-        """Maps a custom AudioModule DNA object to a Pedalboard effect."""
-        if isinstance(module, CompressorModule):
-            params = module.parameters
-            # Mapping our DNA parameters to Pedalboard Compressor parameters
-            return pedalboard.Compressor(
-                threshold_db=params["Threshold"].current_value,
-                ratio=params["Ratio"].current_value,
-                attack_ms=params["Attack"].current_value,
-                release_ms=params["Release"].current_value,
-                # Pedalboard doesn't have a direct "makeup gain" in its basic Compressor,
-                # but it does have output_gain_db in some versions or we can use Gain module.
-                # For simplicity, we'll focus on these primary ones.
-            )
-        return None
 
 if __name__ == "__main__":
     # --- ENGINE SMOKE TEST ---

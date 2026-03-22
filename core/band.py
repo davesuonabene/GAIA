@@ -2,9 +2,9 @@ import random
 from typing import List
 
 try:
-    from .audio_module import AudioModule, CompressorModule, ExpanderModule, TransientShaperModule
+    from .audio_module import AudioModule, CompressorModule, ExpanderModule, TransientShaperModule, SaturationModule
 except (ImportError, ValueError):
-    from audio_module import AudioModule, CompressorModule, ExpanderModule, TransientShaperModule
+    from audio_module import AudioModule, CompressorModule, ExpanderModule, TransientShaperModule, SaturationModule
 
 class Band:
     """A collection of AudioModules processing a specific frequency range."""
@@ -19,7 +19,7 @@ class Band:
         # Add a module
         if random.random() < mutation_rate:
             # Pick randomly from the pool of available modules
-            module_pool = [CompressorModule, ExpanderModule, TransientShaperModule]
+            module_pool = [CompressorModule, ExpanderModule, TransientShaperModule, SaturationModule]
             new_module_cls = random.choice(module_pool)
             self.modules.append(new_module_cls())
 

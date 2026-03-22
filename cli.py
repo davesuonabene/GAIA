@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+import time
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
@@ -9,6 +10,14 @@ from typing import List, Any
 # Ensure we can import from core and ga
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+# Linux-specific imports for terminal management
+try:
+    import tty
+    import termios
+    import select
+except ImportError:
+    pass
+
 from rich.live import Live
 from rich.panel import Panel
 from rich.console import Group
@@ -16,99 +25,79 @@ from rich.text import Text
 from rich.columns import Columns
 from rich.align import Align
 from rich import box
+from rich.layout import Layout
+from rich.table import Table
+from rich.progress import ProgressBar
 
 from core.mix import Mix
 from ga.population import Population
-from core.audio_module import CompressorModule, ExpanderModule, TransientShaperModule
+from core.audio_module import CompressorModule, ExpanderModule, TransientShaperModule, SaturationModule
 from audio.engine import Engine
 
-# Key Constants
+# Constants
 KEY_UP = "UP"
 KEY_DOWN = "DOWN"
 KEY_RIGHT = "RIGHT"
 KEY_LEFT = "LEFT"
 KEY_ENTER = "ENTER"
+KEY_TAB = "TAB"
 KEY_CTRL_C = "CTRL_C"
 KEY_ESC = "ESC"
-KEY_PLUS = "+"
-KEY_EQUAL = "="
-KEY_MINUS = "-"
 KEY_SPACE = " "
 KEY_BACKSPACE = "BACKSPACE"
+KEY_L = "L"
 KEY_E = "E"
 KEY_P = "P"
-KEY_L = "L"
+KEY_BRACKET_LEFT = "["
+KEY_BRACKET_RIGHT = "]"
 
-# --- KEYBOARD LISTENER (Cross-Platform) ---
-try:
-    import msvcrt
-    def get_key():
-        if msvcrt.kbhit():
-            ch = msvcrt.getch()
-            if ch in (b'\x00', b'\xe0'): # Arrow key prefix
-                ch2 = msvcrt.getch()
-                if ch2 == b'H': return KEY_UP
-                elif ch2 == b'P': return KEY_DOWN
-                elif ch2 == b'M': return KEY_RIGHT
-                elif ch2 == b'K': return KEY_LEFT
-            elif ch == b'\r': return KEY_ENTER
-            elif ch == b'\x03': return KEY_CTRL_C
-            elif ch == b'\x1b': return KEY_ESC
-            elif ch == b'\x08': return KEY_BACKSPACE
-            elif ch in (b'+', b'='): return KEY_PLUS
-            elif ch == b'-': return KEY_MINUS
-            elif ch == b' ': return KEY_SPACE
-            elif ch in (b'e', b'E'): return KEY_E
-            elif ch in (b'p', b'P'): return KEY_P
-            elif ch in (b'l', b'L'): return KEY_L
-            else:
-                try: return ch.decode('ascii')
-                except: return None
-        return None
-except ImportError:
-    import tty
-    import termios
-    import select
-    def get_key():
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+class TerminalMode:
+    """Context manager to handle Linux raw terminal mode without flickering."""
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.old_settings = None
+
+    def __enter__(self):
         try:
-            tty.setraw(fd)
-            # Use os.read to avoid buffering issues with sys.stdin
-            ch_bytes = os.read(fd, 1)
-            if not ch_bytes:
-                return None
-            ch = ch_bytes.decode('ascii', errors='ignore')
-            
-            if ch == '\x1b': # Escape sequence
-                # Wait for the next byte to distinguish ESC key from Arrow keys
-                r, _, _ = select.select([fd], [], [], 0.1)
-                if r:
-                    ch2 = os.read(fd, 1).decode('ascii', errors='ignore')
-                    if ch2 in ('[', 'O'):
-                        r2, _, _ = select.select([fd], [], [], 0.1)
-                        if r2:
-                            ch3 = os.read(fd, 1).decode('ascii', errors='ignore')
-                            if ch3 == 'A': return KEY_UP
-                            elif ch3 == 'B': return KEY_DOWN
-                            elif ch3 == 'C': return KEY_RIGHT
-                            elif ch3 == 'D': return KEY_LEFT
-                return KEY_ESC
-            elif ch == '\r': return KEY_ENTER
-            elif ch == '\x03': return KEY_CTRL_C
-            elif ch in ('\x08', '\x7f'): return KEY_BACKSPACE
-            elif ch == '=': return KEY_PLUS
-            elif ch == '-': return KEY_MINUS
-            elif ch == ' ': return KEY_SPACE
-            elif ch in ('e', 'E'): return KEY_E
-            elif ch in ('p', 'P'): return KEY_P
-            elif ch in ('l', 'L'): return KEY_L
-            else:
-                return ch
+            self.old_settings = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
         except Exception:
-            return None
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            pass
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if self.old_settings:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+def get_key(fd):
+    """Robust non-blocking key reader for Linux escape sequences."""
+    r, _, _ = select.select([fd], [], [], 0.02)
+    if not r:
+        return None
+    
+    try:
+        b = os.read(fd, 8)
+    except EOFError:
+        return None
+
+    if b == b'\x1b[A': return KEY_UP
+    if b == b'\x1b[B': return KEY_DOWN
+    if b == b'\x1b[C': return KEY_RIGHT
+    if b == b'\x1b[D': return KEY_LEFT
+    if b == b'\x1b': return KEY_ESC
+    if b in (b'\r', b'\n'): return KEY_ENTER
+    if b == b'\t': return KEY_TAB
+    if b == b'\x03': return KEY_CTRL_C
+    if b in (b'\x08', b'\x7f'): return KEY_BACKSPACE
+    if b == b' ': return KEY_SPACE
+    
+    try:
+        decoded = b.decode('ascii').upper()
+        if decoded == '[': return KEY_BRACKET_LEFT
+        if decoded == ']': return KEY_BRACKET_RIGHT
+        return decoded
+    except Exception:
+        return None
 
 class GaiaTUI:
     def __init__(self, population: Population, audio_data: np.ndarray, sample_rate: int, output_dir: str):
@@ -116,11 +105,29 @@ class GaiaTUI:
         self.audio_data = audio_data
         self.sample_rate = sample_rate
         self.output_dir = output_dir
-        self.depth = 0 # Current active column (0 to 3)
-        self.indices = [0, 0, 0, 0] # Cursor position for each column
+        
+        # Navigation State
+        self.focus_row = 0 # 0: Population, 1: Bands
+        self.selected_mix_idx = 0
+        self.selected_file_idx = 0 # Separate index for file browser
+        self.selected_band_idx = 0
+        self.selected_module_idx = 0
+        self.selected_param_idx = 0
+        self.editing_crossover = False
+        
         self.running = True
         self.engine = Engine(sample_rate=self.sample_rate) if self.sample_rate else None
         self.is_playing = False
+        self.playback_start_time = 0
+        self.playback_duration = 0
+        
+        # Audio Streaming State
+        self.processed_audio = None
+        self.stream = None
+        self.play_idx = 0
+        self.needs_reprocessing = False
+        import threading
+        self.process_thread = None
         
         # Mode and File Browser
         self.mode = "EVOLUTION" if self.audio_data is not None else "FILE_PICKER"
@@ -132,460 +139,375 @@ class GaiaTUI:
         # Inline Editing State
         self.editing = False
         self.edit_buffer = ""
-        
-        self.status_msg_default = "Arrows: Navigate | SPACE: Lock | ENTER: Edit/Evolve | +/-: Adjust | E: Export | P: Play/Stop | L: Browser"
-        self.status_msg = self.status_msg_default
-        if self.mode == "FILE_PICKER":
-            self.status_msg = "Arrows: Select | ENTER: Open/Load | P: Preview | L: Refresh | Backspace: Up"
+        self.status_msg = "Arrows: Navigate/Adjust | TAB: Row | [ ]: Band | ENTER: Edit | SPACE: Play/Stop"
 
     def refresh_file_list(self):
-        """Scans self.current_path for audio files and directories."""
-        extensions = (".wav", ".flac", ".mp3", ".aiff", ".ogg")
+        """Scans path for audio files."""
+        exts = (".wav", ".flac", ".mp3", ".aiff", ".ogg")
         try:
             items = os.listdir(self.current_path)
-            # Filter and sort: Directories first, then supported audio files
-            dirs = sorted([f for f in items if os.path.isdir(os.path.join(self.current_path, f)) and not f.startswith(".")])
-            files = sorted([f for f in items if f.lower().endswith(extensions)])
-            
             self.file_list = [{"name": "..", "type": "dir"}] if os.path.dirname(self.current_path) != self.current_path else []
-            self.file_list += [{"name": d, "type": "dir"} for d in dirs]
-            self.file_list += [{"name": f, "type": "file"} for f in files]
-            
-            self.indices = [0, 0, 0, 0]
-            self.depth = 0
+            self.file_list += [{"name": d, "type": "dir"} for d in sorted(items) if os.path.isdir(os.path.join(self.current_path, d)) and not d.startswith(".")]
+            self.file_list += [{"name": f, "type": "file"} for f in sorted(items) if f.lower().endswith(exts)]
+            self.selected_file_idx = 0
         except Exception as e:
-            self.status_msg = f"Error accessing {self.current_path}: {e}"
-            self.file_list = [{"name": "..", "type": "dir"}]
+            self.status_msg = f"Error: {e}"
+
+    def reprocess_audio_task(self):
+        if self.audio_data is None: return
+        try:
+            idx = self.selected_mix_idx % len(self.population.mixes)
+            mix = self.population.mixes[idx]
+            new_audio = self.engine.process(self.audio_data, mix)
+            self.processed_audio = new_audio
+        except Exception as e:
+            pass
+
+    def request_reprocessing(self):
+        import threading
+        if self.process_thread is None or not self.process_thread.is_alive():
+            self.process_thread = threading.Thread(target=self.reprocess_audio_task, daemon=True)
+            self.process_thread.start()
+
+    def audio_callback(self, outdata, frames, time_info, status):
+        if self.processed_audio is None:
+            outdata.fill(0)
+            return
+        
+        end_idx = min(self.play_idx + frames, self.processed_audio.shape[1])
+        n = end_idx - self.play_idx
+        if n > 0:
+            outdata[:n, :] = self.processed_audio[:, self.play_idx:end_idx].T
+        if n < frames:
+            outdata[n:, :] = 0
+            self.play_idx = 0 # loop playback seamlessly
+        else:
+            self.play_idx += frames
 
     def load_audio(self, filename: str):
-        """Loads a new audio file and switches to EVOLUTION mode."""
         if self.is_playing:
-            sd.stop()
-            self.is_playing = False
-            
-        full_path = os.path.join(self.current_path, filename)
+            self.toggle_playback() # stop playback safely
+        path = os.path.join(self.current_path, filename)
         try:
-            self.status_msg = f"Loading {filename}..."
-            audio_data, sample_rate = sf.read(full_path)
-            if audio_data.ndim == 1:
-                audio_data = audio_data.reshape(1, -1)
-            else:
-                audio_data = audio_data.T
-            self.audio_data = audio_data
-            self.sample_rate = sample_rate
+            data, sr = sf.read(path)
+            self.audio_data = data.T if data.ndim > 1 else data.reshape(1, -1)
+            self.sample_rate = sr
             self.engine = Engine(sample_rate=self.sample_rate)
             self.mode = "EVOLUTION"
-            self.indices = [0, 0, 0, 0]
-            self.depth = 0
-            self.status_msg = f"Loaded {filename}! " + self.status_msg_default
+            self.selected_mix_idx = 0 # Reset to prevent IndexError
+            self.processed_audio = self.audio_data.copy()
+            self.play_idx = 0
+            self.status_msg = f"Loaded {filename}"
         except Exception as e:
-            self.status_msg = f"Error loading {filename}: {e}"
+            self.status_msg = f"Error: {e}"
 
-    def process_current_mix(self) -> np.ndarray:
-        if self.audio_data is None:
-            raise ValueError("No audio data loaded.")
-        mix = self.population.mixes[self.indices[0]]
-        return self.engine.process(self.audio_data, mix)
-
-    def _reset_child_indices(self):
-        """Resets the indices for all columns deeper than the current active column."""
-        for i in range(self.depth + 1, 4):
-            self.indices[i] = 0
-
-    def get_column_data(self, depth: int) -> List[Any]:
-        """Returns the list of objects for a specific Miller Column."""
-        try:
-            if depth == 0:
-                return self.population.mixes
-            
-            mix = self.population.mixes[self.indices[0]]
-            if depth == 1:
-                return ["Crossovers"] + mix.bands
-            
-            tree_items = ["Crossovers"] + mix.bands
-            branch = tree_items[self.indices[1]]
-            
-            if depth == 2:
-                if branch == "Crossovers":
-                    return mix.crossover_params
-                else: 
-                    return branch.modules
+    def toggle_playback(self):
+        if self.audio_data is None: return
+        if self.is_playing:
+            if self.stream:
+                self.stream.stop()
+                self.stream.close()
+                self.stream = None
+            self.is_playing = False
+            self.status_msg = "Stopped."
+        else:
+            try:
+                self.status_msg = "Processing..."
+                self.reprocess_audio_task() # Initial synchronous process
+                self.playback_duration = self.processed_audio.shape[1] / self.sample_rate
                 
-            if depth == 3:
-                if branch == "Crossovers":
-                    return [] 
-                modules = branch.modules
-                if not modules: return []
-                module = modules[self.indices[2]]
-                return list(module.parameters.values())
-                
-        except (IndexError, AttributeError):
-            return []
-        return []
+                self.stream = sd.OutputStream(
+                    samplerate=self.sample_rate, 
+                    channels=self.processed_audio.shape[0], 
+                    callback=self.audio_callback
+                )
+                self.stream.start()
+                self.is_playing = True
+                self.status_msg = "Playing..."
+            except Exception as e:
+                self.status_msg = f"Error: {e}"
+
+    def get_selected_param(self):
+        if self.mode != "EVOLUTION": return None
+        idx = self.selected_mix_idx % len(self.population.mixes)
+        mix = self.population.mixes[idx]
+        if self.editing_crossover:
+            return mix.crossover_params[self.selected_band_idx] if self.selected_band_idx < len(mix.crossover_params) else None
+        band = mix.bands[self.selected_band_idx]
+        if band.modules and self.selected_module_idx < len(band.modules):
+            mod = band.modules[self.selected_module_idx]
+            params = list(mod.parameters.values())
+            return params[self.selected_param_idx] if self.selected_param_idx < len(params) else None
+        return None
+
+    def adjust_value(self, direction: int):
+        p = self.get_selected_param()
+        if p:
+            step = (p.max_bound - p.min_bound) * 0.05 * direction
+            p.current_value = max(p.min_bound, min(p.max_bound, p.current_value + step))
+            if self.editing_crossover: 
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.population.mixes[idx].sort_crossovers()
+            if self.is_playing:
+                self.request_reprocessing()
+
+    def set_value(self, val: float):
+        p = self.get_selected_param()
+        if p:
+            p.current_value = max(p.min_bound, min(p.max_bound, val))
+            if self.editing_crossover:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.population.mixes[idx].sort_crossovers()
+            if self.is_playing:
+                self.request_reprocessing()
 
     def navigate(self, key: str):
-        if not key:
+        if self.editing:
+            if key == KEY_ENTER:
+                try: self.set_value(float(self.edit_buffer))
+                except: pass
+                self.editing = False; self.edit_buffer = ""
+            elif key == KEY_ESC:
+                self.editing = False; self.edit_buffer = ""
+            elif key == KEY_BACKSPACE:
+                self.edit_buffer = self.edit_buffer[:-1]
+            elif key and len(key) == 1 and key != " ":
+                self.edit_buffer += key
             return
-            
-        # File Browser specific navigation
+
+        if key == KEY_SPACE:
+            self.toggle_playback()
+            return
+
         if self.mode == "FILE_PICKER":
             if key == KEY_UP:
-                if self.file_list:
-                    self.indices[0] = (self.indices[0] - 1) % len(self.file_list)
-                    if self.is_playing: # Stop preview if moving
-                        sd.stop()
-                        self.is_playing = False
+                self.selected_file_idx = (self.selected_file_idx - 1) % max(1, len(self.file_list))
             elif key == KEY_DOWN:
-                if self.file_list:
-                    self.indices[0] = (self.indices[0] + 1) % len(self.file_list)
-                    if self.is_playing: # Stop preview if moving
-                        sd.stop()
-                        self.is_playing = False
+                self.selected_file_idx = (self.selected_file_idx + 1) % max(1, len(self.file_list))
             elif key == KEY_ENTER:
                 if self.file_list:
-                    item = self.file_list[self.indices[0]]
+                    item = self.file_list[self.selected_file_idx]
                     if item["type"] == "dir":
-                        if self.is_playing:
-                            sd.stop()
-                            self.is_playing = False
                         self.current_path = os.path.abspath(os.path.join(self.current_path, item["name"]))
                         self.refresh_file_list()
                     else:
                         self.load_audio(item["name"])
             elif key == KEY_BACKSPACE:
-                if self.is_playing:
-                    sd.stop()
-                    self.is_playing = False
                 self.current_path = os.path.abspath(os.path.join(self.current_path, ".."))
                 self.refresh_file_list()
-            elif key == KEY_L:
-                self.refresh_file_list()
-            elif key == KEY_P:
-                self.toggle_preview()
-            elif key == KEY_CTRL_C:
-                if self.is_playing:
-                    sd.stop()
-                self.running = False
             return
 
-        # Global 'Browser' key to switch to file browser
-        if key == KEY_L:
-            if self.is_playing:
-                sd.stop()
-                self.is_playing = False
+        # Evolution Mode Navigation
+        if key == KEY_TAB:
+            self.focus_row = 1 - self.focus_row
+        elif key == KEY_BRACKET_LEFT:
+            self.selected_band_idx = (self.selected_band_idx - 1) % len(self.population.mixes[0].bands)
+            self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
+        elif key == KEY_BRACKET_RIGHT:
+            self.selected_band_idx = (self.selected_band_idx + 1) % len(self.population.mixes[0].bands)
+            self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
+        elif key == KEY_L:
             self.mode = "FILE_PICKER"
             self.refresh_file_list()
-            self.status_msg = "Arrows: Select | ENTER: Open/Load | P: Preview | L: Refresh | Backspace: Up"
             return
 
-        # If we are currently INLINE EDITING a parameter:
-        if self.editing:
-            if key == KEY_ENTER:
-                try:
-                    new_val = float(self.edit_buffer)
-                    self.set_value_directly(new_val)
-                except ValueError:
-                    self.status_msg = "Invalid number. Edit cancelled."
-                self.editing = False
-                self.edit_buffer = ""
-            elif key == KEY_ESC:
-                self.editing = False
-                self.edit_buffer = ""
-                self.status_msg = "Edit cancelled."
-            elif key == KEY_BACKSPACE:
-                self.edit_buffer = self.edit_buffer[:-1]
-            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
-                self.edit_buffer += key
-            return
-
-        # Normal Navigation Logic
-        items = self.get_column_data(self.depth)
-        
-        if key == KEY_UP:
-            if len(items) > 0:
-                self.indices[self.depth] = (self.indices[self.depth] - 1) % len(items)
-                self._reset_child_indices()
-        elif key == KEY_DOWN:
-            if len(items) > 0:
-                self.indices[self.depth] = (self.indices[self.depth] + 1) % len(items)
-                self._reset_child_indices()
-        elif key == KEY_LEFT:
-            if self.depth > 0:
-                self.depth -= 1
-                self._reset_child_indices()
-        elif key == KEY_RIGHT:
-            if self.depth < 3:
-                next_items = self.get_column_data(self.depth + 1)
-                if len(next_items) > 0:
-                    self.depth += 1
-                    if self.indices[self.depth] >= len(next_items):
-                        self.indices[self.depth] = 0
-        elif key == KEY_ENTER:
-            self.execute_action()
-        elif key == KEY_SPACE:
-            self.toggle_lock()
-        elif key == KEY_PLUS:
-            self.adjust_value(1)
-        elif key == KEY_MINUS:
-            self.adjust_value(-1)
-        elif key == KEY_CTRL_C:
-            self.running = False
-        elif key == KEY_E:
-            if self.audio_data is None:
-                self.status_msg = "Cannot export: No audio loaded."
-                return
-            self.status_msg = f"Exporting Mix {self.indices[0]}..."
-            try:
-                processed_audio = self.process_current_mix()
-                os.makedirs(self.output_dir, exist_ok=True)
-                filename = os.path.join(self.output_dir, f"gen_{self.population.generation_count}_mix_{self.indices[0]}.wav")
-                sf.write(filename, processed_audio.T, self.sample_rate)
-                self.status_msg = f"Exported to {filename}!"
-            except Exception as e:
-                self.status_msg = f"Export failed: {e}"
-        elif key == KEY_P:
-            if self.audio_data is None:
-                self.status_msg = "Cannot play: No audio loaded."
-                return
-            if self.is_playing:
-                sd.stop()
-                self.is_playing = False
-                self.status_msg = "Playback stopped."
-            else:
-                self.status_msg = "Processing audio for playback..."
-                try:
-                    processed_audio = self.process_current_mix()
-                    sd.play(processed_audio.T, self.sample_rate)
-                    self.is_playing = True
-                    self.status_msg = "Playing mix..."
-                except Exception as e:
-                    self.status_msg = f"Playback failed: {e}"
-
-    def toggle_preview(self):
-        """Plays or stops a preview of the selected file in the browser."""
-        if not self.file_list: return
-        item = self.file_list[self.indices[0]]
-        if item["type"] != "file": return
-
-        if self.is_playing:
-            sd.stop()
-            self.is_playing = False
-            self.status_msg = "Preview stopped."
+        if self.focus_row == 0:
+            if key == KEY_LEFT:
+                self.selected_mix_idx = (self.selected_mix_idx - 1) % len(self.population.mixes)
+                if self.is_playing: self.request_reprocessing()
+            elif key == KEY_RIGHT:
+                self.selected_mix_idx = (self.selected_mix_idx + 1) % len(self.population.mixes)
+                if self.is_playing: self.request_reprocessing()
+            elif key == KEY_ENTER:
+                self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
+                if self.is_playing: self.request_reprocessing()
         else:
-            full_path = os.path.join(self.current_path, item["name"])
-            self.status_msg = f"Previewing {item['name']}..."
-            try:
-                # Read temporarily for preview
-                data, fs = sf.read(full_path)
-                sd.play(data, fs)
-                self.is_playing = True
-            except Exception as e:
-                self.status_msg = f"Preview failed: {e}"
+            mix = self.population.mixes[self.selected_mix_idx % len(self.population.mixes)]
+            band = mix.bands[self.selected_band_idx]
+            if key == KEY_UP:
+                if self.selected_param_idx > 0:
+                    self.selected_param_idx -= 1
+                elif self.selected_module_idx > 0:
+                    self.selected_module_idx -= 1
+                    self.selected_param_idx = len(band.modules[self.selected_module_idx].parameters) - 1
+                elif not self.editing_crossover:
+                    self.editing_crossover = True
+            elif key == KEY_DOWN:
+                if self.editing_crossover:
+                    self.editing_crossover = False
+                    self.selected_module_idx = 0
+                    self.selected_param_idx = 0
+                elif band.modules:
+                    mod = band.modules[self.selected_module_idx]
+                    if self.selected_param_idx < len(mod.parameters) - 1:
+                        self.selected_param_idx += 1
+                    elif self.selected_module_idx < len(band.modules) - 1:
+                        self.selected_module_idx += 1
+                        self.selected_param_idx = 0
+            elif key == KEY_LEFT:
+                self.adjust_value(-1)
+            elif key == KEY_RIGHT:
+                self.adjust_value(1)
+            elif key == KEY_ENTER:
+                p = self.get_selected_param()
+                if p:
+                    self.editing = True
+                    self.edit_buffer = str(round(p.current_value, 2))
 
-    def get_selected_param(self) -> Any:
-        """Returns the currently selected Parameter object, or None if not at a parameter level."""
-        if self.mode != "EVOLUTION": return None
-        if self.depth == 2:
-            items = self.get_column_data(2)
-            if items and self.indices[1] == 0: # Crossovers branch
-                return items[self.indices[2]]
-        elif self.depth == 3:
-            items = self.get_column_data(3)
-            if items:
-                return items[self.indices[3]]
-        return None
-
-    def toggle_lock(self):
-        """Toggles the lock status of the currently selected parameter."""
-        param = self.get_selected_param()
-        if param:
-            param.is_locked = not param.is_locked
-            self.status_msg = f"Toggled Lock: {param.name} is now {'LOCKED' if param.is_locked else 'FREE'}"
-
-    def set_value_directly(self, new_val: float):
-        """Sets the value of the selected parameter, respecting bounds."""
-        param = self.get_selected_param()
-        if param:
-            param.current_value = max(param.min_bound, min(param.max_bound, new_val))
-            self.status_msg = f"Set {param.name} to {param.current_value:.2f}"
-            
-            # If it's a crossover, resort and rename to maintain logic, and update cursor
-            if self.depth == 2 and self.indices[1] == 0:
-                mix = self.population.mixes[self.indices[0]]
-                mix.sort_crossovers()
-                self.indices[2] = mix.crossover_params.index(param)
-
-    def adjust_value(self, direction: int):
-        """Manually steps a selected parameter's value up or down."""
-        param = self.get_selected_param()
-        if not param:
-            return
-            
-        if self.depth == 2: # Crossover
-            step = (param.max_bound - param.min_bound) * 0.02 * direction
-        else: # Module param
-            step = (param.max_bound - param.min_bound) * 0.05 * direction
-            
-        new_val = param.current_value + step
-        param.current_value = max(param.min_bound, min(param.max_bound, new_val))
-        self.status_msg = f"Adjusted {param.name} to {param.current_value:.2f}"
+    def render(self):
+        # Build the UI Layout dynamically to avoid out-of-bounds rendering
+        layout = Layout()
         
-        if self.depth == 2 and self.indices[1] == 0:
-            mix = self.population.mixes[self.indices[0]]
-            mix.sort_crossovers()
-            self.indices[2] = mix.crossover_params.index(param)
+        # Common Header and Status
+        header_text = Text(f"GAIA GENMIX | Gen {self.population.generation_count}", style="bold magenta", justify="center")
+        header_panel = Panel(header_text, box=box.DOUBLE)
+        status_panel = Panel(Text(self.status_msg, style="bold yellow" if self.editing else "italic green"), box=box.SIMPLE)
 
-    def execute_action(self):
-        """Action logic for Enter key."""
-        if self.mode != "EVOLUTION": return
-        if self.depth == 0:
-            # Evolve whole population from this parent
-            self.population.generate_next_generation(self.indices[0], 0.5, 0.5)
-            self._reset_child_indices()
-            self.status_msg = f"Evolved generation {self.population.generation_count} from Mix {self.indices[0]}!"
-        elif self.depth in (2, 3):
-            param = self.get_selected_param()
-            if param:
-                # Start inline editing
-                self.editing = True
-                self.edit_buffer = str(round(param.current_value, 2))
-                self.status_msg = f"Editing {param.name} (Min: {param.min_bound}, Max: {param.max_bound}). ENTER to confirm, ESC to cancel."
-
-    def render_column_content(self, depth: int) -> Group:
         if self.mode == "FILE_PICKER":
-            if depth == 0:
-                content = []
-                # Show current path as a header
-                content.append(Text(f" Path: {self.current_path}", style="bold yellow"))
-                content.append(Text("-" * 20, style="dim"))
+            # File Browser Layout
+            try:
+                term_lines = os.get_terminal_size().lines
+                browser_height = max(5, term_lines - 10)
+            except:
+                browser_height = 10
                 
-                for i, item in enumerate(self.file_list):
-                    prefix = "▶ " if i == self.indices[0] else "  "
-                    style = "bold white on blue" if i == self.indices[0] else "white"
-                    
-                    display_name = item["name"]
-                    if item["type"] == "dir":
-                        display_name = f"[DIR] {display_name}"
-                    
-                    content.append(Text(f"{prefix}{display_name}", style=style))
-                
-                if not self.file_list:
-                    content.append(Text("  (No audio files or directories found)", style="dim"))
-                return Group(*content)
-            else:
-                return Group(Text("  ---", style="dim"))
-
-        items = self.get_column_data(depth)
-        is_active_col = (self.depth == depth)
-        
-        content = []
-        for i, item in enumerate(items):
-            # 1. Determine Label
-            label = ""
-            if depth == 0: label = f"Mix {i}"
-            elif depth == 1: label = item if isinstance(item, str) else f"Band: {item.name}"
-            elif depth == 2:
-                if self.indices[1] == 0: # Crossovers
-                    if self.editing and is_active_col and i == self.indices[depth]:
-                        label = f"{item.name}: {self.edit_buffer} Hz █"
-                    else:
-                        label = f"{item.name}: {item.current_value:.1f} Hz"
-                else: # Modules
-                    label = f"[{i}] {item.name}"
-            elif depth == 3: # Module Params
-                if self.editing and is_active_col and i == self.indices[depth]:
-                    label = f"{item.name}: {self.edit_buffer} █"
-                else:
-                    label = f"{item.name}: {item.current_value:7.2f}"
-
-            # 2. Status Indicators
-            locked = " 🔒" if getattr(item, 'is_locked', False) else ""
+            start_idx = max(0, self.selected_file_idx - browser_height // 2)
+            visible_files = self.file_list[start_idx:start_idx + browser_height]
             
-            # 3. Styling
-            text_style = "white"
-            prefix = "  "
-            if i == self.indices[depth]:
-                if is_active_col:
-                    if self.editing:
-                        text_style = "bold black on yellow"
-                    else:
-                        text_style = "bold white on blue"
-                    prefix = "▶ "
+            content = [Text(f"Path: {self.current_path}", style="bold yellow"), Text("-" * 20, style="dim")]
+            for i, item in enumerate(visible_files):
+                idx = start_idx + i
+                prefix = "▶ " if idx == self.selected_file_idx else "  "
+                style = "bold white on blue" if idx == self.selected_file_idx else "white"
+                display_name = f"[DIR] {item['name']}" if item["type"] == "dir" else item["name"]
+                content.append(Text(f"{prefix}{display_name}", style=style))
+                
+            browser_panel = Panel(Group(*content), title="File Browser", border_style="cyan")
+            
+            layout.split_column(
+                Layout(header_panel, size=3),
+                Layout(browser_panel, ratio=1),
+                Layout(status_panel, size=3)
+            )
+            return layout
+
+        else:
+            # Evolution Layout
+            
+            # 1. Population Row
+            mix_texts = []
+            for i in range(len(self.population.mixes)):
+                is_sel = (self.focus_row == 0 and i == self.selected_mix_idx)
+                prefix = "▶ " if is_sel else "  "
+                style = "bold white on blue" if is_sel else "white" if i == self.selected_mix_idx else "dim"
+                mix_texts.append(Text(f"{prefix}Mix {i}", style=style))
+                
+            pop_panel = Panel(Columns(mix_texts, expand=True, align="center"), title="Population", border_style="magenta" if self.focus_row == 0 else "dim")
+
+            # 2. Bands Row (using a horizontal layout to prevent wrapping)
+            idx = self.selected_mix_idx % len(self.population.mixes)
+            mix = self.population.mixes[idx]
+            band_layout = Layout(name="bands")
+            band_layout.split_row(*[Layout(name=f"band_{i}") for i in range(len(mix.bands))])
+            
+            for i, band in enumerate(mix.bands):
+                is_band_sel = (self.focus_row == 1 and self.selected_band_idx == i)
+                items = []
+                
+                # Crossover rendering
+                if i < len(mix.crossover_params):
+                    xo = mix.crossover_params[i]
+                    is_xo_sel = is_band_sel and self.editing_crossover
+                    txt = self.edit_buffer if (is_xo_sel and self.editing) else f"{xo.current_value:.0f}"
+                    style = "bold black on yellow" if (is_xo_sel and self.editing) else "bold white on blue" if is_xo_sel else "cyan"
+                    items.append(Text(f"XO: {txt}Hz", style=style, overflow="ellipsis", no_wrap=True))
+                    items.append(Text("-" * 10, style="dim"))
                 else:
-                    text_style = "bold grey74" # Path highlight
-                    prefix = "  "
+                    items.append(Text("XO: Nyq", style="dim", overflow="ellipsis", no_wrap=True))
+                    items.append(Text("-" * 10, style="dim"))
 
-            content.append(Text(f"{prefix}{label}{locked}", style=text_style))
+                # Modules rendering
+                for m_idx, mod in enumerate(band.modules):
+                    is_mod_sel = is_band_sel and not self.editing_crossover and self.selected_module_idx == m_idx
+                    mod_name = mod.name[:7] + "." if len(mod.name) > 8 else mod.name
+                    style = "bold white on blue" if is_mod_sel else "white"
+                    items.append(Text(f"[{mod_name}]", style=style, overflow="ellipsis", no_wrap=True))
+                    
+                    for p_idx, (p_name, p) in enumerate(mod.parameters.items()):
+                        is_p_sel = is_mod_sel and self.selected_param_idx == p_idx
+                        val_txt = self.edit_buffer if (is_p_sel and self.editing) else f"{p.current_value:.1f}"
+                        short_name = p_name[:5]
+                        style = "bold black on yellow" if (is_p_sel and self.editing) else "bold white on cyan" if is_p_sel else "dim"
+                        items.append(Text(f" {short_name}: {val_txt}", style=style, overflow="ellipsis", no_wrap=True))
+                        
+                band_panel = Panel(Group(*items), title=f"B{i+1}", border_style="blue" if is_band_sel else "dim")
+                band_layout[f"band_{i}"].update(band_panel)
 
-        if not items:
-            content.append(Text("  (None)", style="dim"))
+            # 3. Audio Progress Row
+            if self.is_playing:
+                elapsed = self.play_idx / self.sample_rate if self.sample_rate else 0
+                pct = (elapsed / self.playback_duration) * 100 if self.playback_duration > 0 else 0
+                prog_text = Text(f"Play: {elapsed:.1f}s", style="bold cyan")
+                prog_bar = ProgressBar(total=100, completed=pct)
+                audio_panel = Panel(Columns([prog_text, prog_bar], expand=True), title="Audio", border_style="green")
+            else:
+                audio_panel = Panel(Text("Stopped", style="dim"), title="Audio", border_style="dim")
 
-        return Group(*content)
+            # Final Assembly of Evolution mode
+            layout.split_column(
+                Layout(header_panel, size=3),
+                Layout(pop_panel, size=3),
+                band_layout, # takes remaining ratio=1
+                Layout(audio_panel, size=3),
+                Layout(status_panel, size=3)
+            )
+            return layout
 
 def main():
-    parser = argparse.ArgumentParser(description="GenMix Gaia TUI")
-    parser.add_argument("input_file", type=str, nargs="?", help="Path to the input audio file")
-    parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output files")
+    parser = argparse.ArgumentParser(description="Gaia GenMix TUI")
+    parser.add_argument("input_file", type=str, nargs="?", help="Optional audio file to load on start")
     args = parser.parse_args()
 
-    audio_data = None
-    sample_rate = 44100
+    audio_data, sr = None, 44100
     if args.input_file:
         try:
-            audio_data, sample_rate = sf.read(args.input_file)
-            # soundfile returns (samples, channels). pedalboard needs (channels, samples).
-            if audio_data.ndim == 1:
-                audio_data = audio_data.reshape(1, -1)
-            else:
-                audio_data = audio_data.T
+            audio_data, sr = sf.read(args.input_file)
+            audio_data = audio_data.T if audio_data.ndim > 1 else audio_data.reshape(1, -1)
         except Exception as e:
-            print(f"Error loading audio file: {e}")
+            print(f"Error loading {args.input_file}: {e}")
             sys.exit(1)
 
-    # Setup initial population (4 crossovers = 5 bands)
+    # Initialize a dummy population
     initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0, 8000.0]) for _ in range(5)]
     for m in initial_mixes:
         m.bands[0].modules.append(CompressorModule())
-        m.bands[1].modules.append(TransientShaperModule())
+        m.bands[1].modules.append(SaturationModule())
         m.bands[2].modules.append(ExpanderModule())
         m.bands[3].modules.append(CompressorModule())
         m.bands[4].modules.append(TransientShaperModule())
 
     pop = Population(initial_mixes)
-    tui = GaiaTUI(pop, audio_data, sample_rate, args.output_dir)
+    tui = GaiaTUI(pop, audio_data, sr, ".")
 
-    with Live(auto_refresh=False, screen=True) as live:
-        while tui.running:
-            # 1. Header
-            header = Panel(
-                Align.center(f"[bold magenta]GAIA EVOLUTION SYSTEM | Gen {pop.generation_count}[/bold magenta]"), 
-                box=box.DOUBLE
-            )
-            
-            # 2. Miller Columns
-            c0 = Panel(tui.render_column_content(0), title="[bold]Population[/bold]", border_style="cyan" if tui.depth == 0 else "dim")
-            c1 = Panel(tui.render_column_content(1), title="[bold]Mix Tree[/bold]", border_style="cyan" if tui.depth == 1 else "dim")
-            c2 = Panel(tui.render_column_content(2), title="[bold]Modules/XO[/bold]", border_style="cyan" if tui.depth == 2 else "dim")
-            c3 = Panel(tui.render_column_content(3), title="[bold]Params[/bold]", border_style="cyan" if tui.depth == 3 else "dim")
-            
-            columns = Columns([c0, c1, c2, c3], expand=True)
-            
-            # 3. Footer
-            footer_style = "bold yellow" if tui.editing else "italic green"
-            footer = Panel(Text(tui.status_msg, style=footer_style), box=box.SIMPLE)
-            
-            # Assemble & Render
-            renderable = Group(header, columns, footer)
-            live.update(renderable, refresh=True)
-            
-            # Input
-            key = get_key()
-            if key:
-                tui.navigate(key)
+    with TerminalMode() as term:
+        # Use Rich Live to render the UI. Set auto_refresh=False to avoid background thread issues.
+        with Live(screen=True, auto_refresh=False) as live:
+            while tui.running:
+                # Update the display layout and refresh
+                live.update(tui.render(), refresh=True)
+                
+                # Check for keyboard input non-blocking
+                key = get_key(term.fd)
+                if key == KEY_CTRL_C:
+                    tui.running = False
+                elif key:
+                    tui.navigate(key)
+                
+                # Prevent CPU spin
+                time.sleep(0.01)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         pass
-    print("\nExited Gaia.")

@@ -32,30 +32,36 @@ gaia/
 │   └── population.py      # Population management and next-gen spawning
 ├── audio/                 # Audio Engine (DSP & Analysis)
 │   ├── analyzer.py        # Feature extraction (RMS, Transients, etc.)
-│   ├── crossover.py       # Phase-accurate Linkwitz-Riley splitting
-│   └── engine.py          # Pedalboard-based rendering
-└── cli.py                 # Miller Column TUI & Keyboard Handler
-```
+3.  **Level 3: AudioModule (The Gene Group)**
+    *   DSP processors: `Compressor`, `Expander`, `Transient Shaper`, and `Saturation`.
+    *   DNA: A set of internal `Parameter` objects.
+
+...
 
 ## 🎮 Interactive TUI (cli.py)
 
-The interface uses a **Miller Column** navigation system for deep-diving into the population's DNA.
+The interface uses a responsive layout for deep-diving into the population's DNA and real-time playback control.
 
 ### Navigation Controls
-*   **Arrows (↑ / ↓)**: Move the cursor up and down within the current column.
-*   **Arrows (← / →)**: Navigate between hierarchy levels (Population → Mix Tree → Modules/XO → Params).
-*   **SPACE**: Toggle **LOCK** 🔒 on the selected parameter. Locked parameters will not mutate.
-*   **ENTER**:
-    *   At the **Population** level (far left): Evolve a new generation from the selected parent.
-    *   At the **Parameter** level (far right): Enter **Inline Edit** mode to type a specific value.
-*   **Plus (+) / Minus (-)**: Manually nudge a parameter value up or down.
+*   **Arrows (↑ / ↓)**: Navigate between Modules and Parameters.
+*   **Arrows (← / →)**: Adjust the value of the selected parameter.
+*   **Brackets ([ / ])**: Switch between different frequency Bands.
+*   **TAB**: Switch focus between the **Population** and **Bands** rows.
+*   **SPACE / P**: Toggle **Playback** 🔊 of the current mix.
+*   **ENTER**: 
+    *   In **Population Row**: Evolve a new generation from the selected parent.
+    *   In **Bands Row**: Enter **Inline Edit** mode for the selected parameter.
+*   **Plus (+) / Minus (-)**: Manually nudge a parameter value.
+*   **L**: Return to **File Browser** to load a different audio file.
+*   **E**: **Export** the current mix to a WAV file.
 *   **ESC**: Cancel inline editing.
 *   **CTRL+C**: Exit the application.
 
 ### Key Features
-*   **Safe-Spawning**: New modules are initialized with transparent settings (e.g., 1:1 ratio) to prevent audio surprises.
-*   **Cross-Platform Input**: Low-level keyboard listener optimized for Linux (unbuffered `os.read`) and Windows.
-*   **Real-time Feedback**: Color-coded columns show the path from the population down to the specific parameter.
+*   **Audio Engine**: Powered by `pedalboard` and `sounddevice`. Features a master Limiter to prevent clipping.
+*   **Saturation Module**: New DSP module with `Drive` and `Mix` controls for harmonic enrichment.
+*   **Progress Tracking**: Real-time progress bar showing playback position and track duration.
+*   **Safe-Spawning**: New modules are initialized with transparent settings to prevent audio surprises.
 
 ## 🚀 Getting Started
 
