@@ -37,6 +37,7 @@ KEY_SPACE = " "
 KEY_BACKSPACE = "BACKSPACE"
 KEY_E = "E"
 KEY_P = "P"
+KEY_L = "L"
 
 # --- KEYBOARD LISTENER (Cross-Platform) ---
 try:
@@ -59,6 +60,7 @@ try:
             elif ch == b' ': return KEY_SPACE
             elif ch in (b'e', b'E'): return KEY_E
             elif ch in (b'p', b'P'): return KEY_P
+            elif ch in (b'l', b'L'): return KEY_L
             else:
                 try: return ch.decode('ascii')
                 except: return None
@@ -100,6 +102,7 @@ except ImportError:
             elif ch == ' ': return KEY_SPACE
             elif ch in ('e', 'E'): return KEY_E
             elif ch in ('p', 'P'): return KEY_P
+            elif ch in ('l', 'L'): return KEY_L
             else:
                 return ch
         except Exception:
@@ -116,16 +119,71 @@ class GaiaTUI:
         self.depth = 0 # Current active column (0 to 3)
         self.indices = [0, 0, 0, 0] # Cursor position for each column
         self.running = True
-        self.engine = Engine(sample_rate=self.sample_rate)
+        self.engine = Engine(sample_rate=self.sample_rate) if self.sample_rate else None
         self.is_playing = False
+        
+        # Mode and File Browser
+        self.mode = "EVOLUTION" if self.audio_data is not None else "FILE_PICKER"
+        self.current_path = os.path.abspath(".")
+        self.file_list = []
+        if self.mode == "FILE_PICKER":
+            self.refresh_file_list()
         
         # Inline Editing State
         self.editing = False
         self.edit_buffer = ""
         
-        self.status_msg = "Arrows: Navigate | SPACE: Lock | ENTER: Edit/Evolve | +/-: Adjust | E: Export | P: Play/Stop"
+        self.status_msg_default = "Arrows: Navigate | SPACE: Lock | ENTER: Edit/Evolve | +/-: Adjust | E: Export | P: Play/Stop | L: Browser"
+        self.status_msg = self.status_msg_default
+        if self.mode == "FILE_PICKER":
+            self.status_msg = "Arrows: Select | ENTER: Open/Load | P: Preview | L: Refresh | Backspace: Up"
+
+    def refresh_file_list(self):
+        """Scans self.current_path for audio files and directories."""
+        extensions = (".wav", ".flac", ".mp3", ".aiff", ".ogg")
+        try:
+            items = os.listdir(self.current_path)
+            # Filter and sort: Directories first, then supported audio files
+            dirs = sorted([f for f in items if os.path.isdir(os.path.join(self.current_path, f)) and not f.startswith(".")])
+            files = sorted([f for f in items if f.lower().endswith(extensions)])
+            
+            self.file_list = [{"name": "..", "type": "dir"}] if os.path.dirname(self.current_path) != self.current_path else []
+            self.file_list += [{"name": d, "type": "dir"} for d in dirs]
+            self.file_list += [{"name": f, "type": "file"} for f in files]
+            
+            self.indices = [0, 0, 0, 0]
+            self.depth = 0
+        except Exception as e:
+            self.status_msg = f"Error accessing {self.current_path}: {e}"
+            self.file_list = [{"name": "..", "type": "dir"}]
+
+    def load_audio(self, filename: str):
+        """Loads a new audio file and switches to EVOLUTION mode."""
+        if self.is_playing:
+            sd.stop()
+            self.is_playing = False
+            
+        full_path = os.path.join(self.current_path, filename)
+        try:
+            self.status_msg = f"Loading {filename}..."
+            audio_data, sample_rate = sf.read(full_path)
+            if audio_data.ndim == 1:
+                audio_data = audio_data.reshape(1, -1)
+            else:
+                audio_data = audio_data.T
+            self.audio_data = audio_data
+            self.sample_rate = sample_rate
+            self.engine = Engine(sample_rate=self.sample_rate)
+            self.mode = "EVOLUTION"
+            self.indices = [0, 0, 0, 0]
+            self.depth = 0
+            self.status_msg = f"Loaded {filename}! " + self.status_msg_default
+        except Exception as e:
+            self.status_msg = f"Error loading {filename}: {e}"
 
     def process_current_mix(self) -> np.ndarray:
+        if self.audio_data is None:
+            raise ValueError("No audio data loaded.")
         mix = self.population.mixes[self.indices[0]]
         return self.engine.process(self.audio_data, mix)
 
@@ -169,6 +227,57 @@ class GaiaTUI:
         if not key:
             return
             
+        # File Browser specific navigation
+        if self.mode == "FILE_PICKER":
+            if key == KEY_UP:
+                if self.file_list:
+                    self.indices[0] = (self.indices[0] - 1) % len(self.file_list)
+                    if self.is_playing: # Stop preview if moving
+                        sd.stop()
+                        self.is_playing = False
+            elif key == KEY_DOWN:
+                if self.file_list:
+                    self.indices[0] = (self.indices[0] + 1) % len(self.file_list)
+                    if self.is_playing: # Stop preview if moving
+                        sd.stop()
+                        self.is_playing = False
+            elif key == KEY_ENTER:
+                if self.file_list:
+                    item = self.file_list[self.indices[0]]
+                    if item["type"] == "dir":
+                        if self.is_playing:
+                            sd.stop()
+                            self.is_playing = False
+                        self.current_path = os.path.abspath(os.path.join(self.current_path, item["name"]))
+                        self.refresh_file_list()
+                    else:
+                        self.load_audio(item["name"])
+            elif key == KEY_BACKSPACE:
+                if self.is_playing:
+                    sd.stop()
+                    self.is_playing = False
+                self.current_path = os.path.abspath(os.path.join(self.current_path, ".."))
+                self.refresh_file_list()
+            elif key == KEY_L:
+                self.refresh_file_list()
+            elif key == KEY_P:
+                self.toggle_preview()
+            elif key == KEY_CTRL_C:
+                if self.is_playing:
+                    sd.stop()
+                self.running = False
+            return
+
+        # Global 'Browser' key to switch to file browser
+        if key == KEY_L:
+            if self.is_playing:
+                sd.stop()
+                self.is_playing = False
+            self.mode = "FILE_PICKER"
+            self.refresh_file_list()
+            self.status_msg = "Arrows: Select | ENTER: Open/Load | P: Preview | L: Refresh | Backspace: Up"
+            return
+
         # If we are currently INLINE EDITING a parameter:
         if self.editing:
             if key == KEY_ENTER:
@@ -222,6 +331,9 @@ class GaiaTUI:
         elif key == KEY_CTRL_C:
             self.running = False
         elif key == KEY_E:
+            if self.audio_data is None:
+                self.status_msg = "Cannot export: No audio loaded."
+                return
             self.status_msg = f"Exporting Mix {self.indices[0]}..."
             try:
                 processed_audio = self.process_current_mix()
@@ -232,6 +344,9 @@ class GaiaTUI:
             except Exception as e:
                 self.status_msg = f"Export failed: {e}"
         elif key == KEY_P:
+            if self.audio_data is None:
+                self.status_msg = "Cannot play: No audio loaded."
+                return
             if self.is_playing:
                 sd.stop()
                 self.is_playing = False
@@ -246,8 +361,30 @@ class GaiaTUI:
                 except Exception as e:
                     self.status_msg = f"Playback failed: {e}"
 
+    def toggle_preview(self):
+        """Plays or stops a preview of the selected file in the browser."""
+        if not self.file_list: return
+        item = self.file_list[self.indices[0]]
+        if item["type"] != "file": return
+
+        if self.is_playing:
+            sd.stop()
+            self.is_playing = False
+            self.status_msg = "Preview stopped."
+        else:
+            full_path = os.path.join(self.current_path, item["name"])
+            self.status_msg = f"Previewing {item['name']}..."
+            try:
+                # Read temporarily for preview
+                data, fs = sf.read(full_path)
+                sd.play(data, fs)
+                self.is_playing = True
+            except Exception as e:
+                self.status_msg = f"Preview failed: {e}"
+
     def get_selected_param(self) -> Any:
         """Returns the currently selected Parameter object, or None if not at a parameter level."""
+        if self.mode != "EVOLUTION": return None
         if self.depth == 2:
             items = self.get_column_data(2)
             if items and self.indices[1] == 0: # Crossovers branch
@@ -300,6 +437,7 @@ class GaiaTUI:
 
     def execute_action(self):
         """Action logic for Enter key."""
+        if self.mode != "EVOLUTION": return
         if self.depth == 0:
             # Evolve whole population from this parent
             self.population.generate_next_generation(self.indices[0], 0.5, 0.5)
@@ -314,6 +452,29 @@ class GaiaTUI:
                 self.status_msg = f"Editing {param.name} (Min: {param.min_bound}, Max: {param.max_bound}). ENTER to confirm, ESC to cancel."
 
     def render_column_content(self, depth: int) -> Group:
+        if self.mode == "FILE_PICKER":
+            if depth == 0:
+                content = []
+                # Show current path as a header
+                content.append(Text(f" Path: {self.current_path}", style="bold yellow"))
+                content.append(Text("-" * 20, style="dim"))
+                
+                for i, item in enumerate(self.file_list):
+                    prefix = "▶ " if i == self.indices[0] else "  "
+                    style = "bold white on blue" if i == self.indices[0] else "white"
+                    
+                    display_name = item["name"]
+                    if item["type"] == "dir":
+                        display_name = f"[DIR] {display_name}"
+                    
+                    content.append(Text(f"{prefix}{display_name}", style=style))
+                
+                if not self.file_list:
+                    content.append(Text("  (No audio files or directories found)", style="dim"))
+                return Group(*content)
+            else:
+                return Group(Text("  ---", style="dim"))
+
         items = self.get_column_data(depth)
         is_active_col = (self.depth == depth)
         
@@ -367,28 +528,19 @@ def main():
     parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output files")
     args = parser.parse_args()
 
-    input_file = args.input_file
-    if not input_file:
-        while True:
-            try:
-                input_file = input("Enter path to input audio file: ").strip()
-                if os.path.isfile(input_file):
-                    break
-                print(f"Error: File '{input_file}' not found. Please try again.")
-            except (KeyboardInterrupt, EOFError):
-                print("\nExited Gaia.")
-                sys.exit(0)
-
-    try:
-        audio_data, sample_rate = sf.read(input_file)
-        # soundfile returns (samples, channels). pedalboard needs (channels, samples).
-        if audio_data.ndim == 1:
-            audio_data = audio_data.reshape(1, -1)
-        else:
-            audio_data = audio_data.T
-    except Exception as e:
-        print(f"Error loading audio file: {e}")
-        sys.exit(1)
+    audio_data = None
+    sample_rate = 44100
+    if args.input_file:
+        try:
+            audio_data, sample_rate = sf.read(args.input_file)
+            # soundfile returns (samples, channels). pedalboard needs (channels, samples).
+            if audio_data.ndim == 1:
+                audio_data = audio_data.reshape(1, -1)
+            else:
+                audio_data = audio_data.T
+        except Exception as e:
+            print(f"Error loading audio file: {e}")
+            sys.exit(1)
 
     # Setup initial population (4 crossovers = 5 bands)
     initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0, 8000.0]) for _ in range(5)]
