@@ -40,13 +40,15 @@ gaia/
 
 ## 🎮 Interactive TUI (cli.py)
 
-The interface uses a responsive layout for deep-diving into the population's DNA and real-time playback control.
+The interface uses a responsive layout for deep-diving into the population's DNA and real-time playback control, built with a Focus Zone state machine.
 
 ### Navigation Controls
-*   **Arrows (↑ / ↓)**: Navigate between Modules and Parameters.
-*   **Arrows (← / →)**: Adjust the value of the selected parameter.
+*   **TAB**: Cycle focus globally between the `MENU`, `POPULATION`, `BANDS` (horizontally), and `PLAYBACK` zones.
+*   **Arrows (↑ / ↓ / ← / →)**: Navigate contextually *within* the currently focused zone.
+    *   *In Population*: Select different mix candidates.
+    *   *In Bands*: Navigate modules and adjust parameters.
+    *   *In Playback*: Scrub audio backward and forward by 5 seconds.
 *   **Brackets ([ / ])**: Switch between different frequency Bands.
-*   **TAB**: Switch focus between the **Population** and **Bands** rows.
 *   **SPACE / P**: Toggle **Playback** 🔊 of the current mix.
 *   **ENTER**: 
     *   In **Population Row**: Evolve a new generation from the selected parent.
@@ -60,8 +62,13 @@ The interface uses a responsive layout for deep-diving into the population's DNA
 ### Key Features
 *   **Audio Engine**: Powered by `pedalboard` and `sounddevice`. Features a master Limiter to prevent clipping.
 *   **Saturation Module**: New DSP module with `Drive` and `Mix` controls for harmonic enrichment.
-*   **Progress Tracking**: Real-time progress bar showing playback position and track duration.
+*   **Real-time Streaming**: Audio is processed continuously in a background thread, preventing UI lockups.
 *   **Safe-Spawning**: New modules are initialized with transparent settings to prevent audio surprises.
+
+## 🔬 Analysis Engine
+The `audio/analyzer.py` system calculates feature data for evolutionary fitness.
+*   **Configurable Pipeline**: A dataclass `AnalysisConfig` controls which features (RMS, transients, spectral centroid, BPM, MFCC) are extracted.
+*   **Track Metadata**: The `core/metadata.py` module manages basic file info to be fed into the analyzer.
 
 ## 🚀 Getting Started
 

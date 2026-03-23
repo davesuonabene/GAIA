@@ -225,6 +225,14 @@ class GaiaTUI:
             self.selected_mix_idx = 0 # Reset to prevent IndexError
             self.processed_audio = self.audio_data.copy()
             self.play_idx = 0
+            
+            # Update Track Metadata
+            duration_sec = self.audio_data.shape[1] / sr
+            self.metadata.filename = filename
+            self.metadata.sample_rate = sr
+            self.metadata.channels = self.audio_data.shape[0]
+            self.metadata.duration_sec = duration_sec
+            
             self.status_msg = f"Loaded {filename}"
         except Exception as e:
             self.status_msg = f"Error: {e}"
@@ -378,10 +386,12 @@ class GaiaTUI:
     def _handle_playback_input(self, key: str):
         if key == KEY_LEFT:
             if self.sample_rate:
-                self.play_idx = max(0, self.play_idx - self.sample_rate)
+                # Scrub 5s back
+                self.play_idx = max(0, self.play_idx - (5 * self.sample_rate))
         elif key == KEY_RIGHT:
             if self.sample_rate and self.processed_audio is not None:
-                self.play_idx = min(self.processed_audio.shape[1] - 1, self.play_idx + self.sample_rate)
+                # Scrub 5s forward
+                self.play_idx = min(self.processed_audio.shape[1] - 1, self.play_idx + (5 * self.sample_rate))
 
     def _handle_population_input(self, key: str):
         if key == KEY_LEFT:
@@ -440,7 +450,13 @@ class GaiaTUI:
         header_text = Text(f"GAIA GENMIX | Gen {self.population.generation_count}", style="bold magenta", justify="center")
         header_content = Columns([header_text] + menu_texts, expand=True, align="center")
         header_panel = Panel(header_content, box=box.DOUBLE, border_style="magenta" if self.focus_zone == FocusZone.MENU else "dim")
-        status_panel = Panel(Text(self.status_msg, style="bold yellow" if self.editing else "italic green"), box=box.SIMPLE)
+        
+        # Footer / Status Panel
+        meta = self.metadata
+        bpm_str = f"{meta.bpm} BPM" if meta.bpm else "No BPM"
+        meta_str = f"File: {meta.filename or 'None'} | {meta.sample_rate}Hz | {meta.channels}ch | {bpm_str}"
+        footer_text = f"{self.status_msg}  |  {meta_str}"
+        status_panel = Panel(Text(footer_text, style="bold yellow" if self.editing else "italic green"), box=box.SIMPLE)
 
         if self.mode == "FILE_PICKER":
             # File Browser Layout
@@ -523,14 +539,18 @@ class GaiaTUI:
                 band_layout[f"band_{i}"].update(band_panel)
 
             # 3. Audio Progress Row
+            elapsed = self.play_idx / self.sample_rate if self.sample_rate else 0
+            pct = (elapsed / self.playback_duration) if self.playback_duration > 0 else 0
+            bars_filled = int(pct * 20)
+            bars_empty = 20 - bars_filled
+            progress_bar = f"[{'█' * bars_filled}{'░' * bars_empty}]"
+            
             if self.is_playing:
-                elapsed = self.play_idx / self.sample_rate if self.sample_rate else 0
-                pct = (elapsed / self.playback_duration) * 100 if self.playback_duration > 0 else 0
-                prog_text = Text(f"Play: {elapsed:.1f}s", style="bold cyan")
-                prog_bar = ProgressBar(total=100, completed=pct)
-                audio_panel = Panel(Columns([prog_text, prog_bar], expand=True), title="Audio", border_style="green" if self.focus_zone == FocusZone.PLAYBACK else "dim")
+                prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s"
+                audio_panel = Panel(Text(prog_str, style="bold cyan"), title="Audio", border_style="green" if self.focus_zone == FocusZone.PLAYBACK else "dim")
             else:
-                audio_panel = Panel(Text("Stopped", style="dim"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
+                prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s (Stopped)"
+                audio_panel = Panel(Text(prog_str, style="dim"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
 
             # Final Assembly of Evolution mode
             layout.split_column(
