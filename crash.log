@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/home/dave/.openclaw/workspace/projects/gaia/cli.py", line 1164, in main
-    tui.navigate(key)
-    ~~~~~~~~~~~~^^^^^
-  File "/home/dave/.openclaw/workspace/projects/gaia/cli.py", line 743, in navigate
-    if not isinstance(item, str) and not isinstance(item, Parameter):
-                                                          ^^^^^^^^^
-NameError: name 'Parameter' is not defined
