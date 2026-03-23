@@ -238,9 +238,10 @@ class GaiaTUI:
             idx = self.selected_mix_idx % len(self.population.mixes)
             mix = self.population.mixes[idx]
             new_audio = self.engine.process(self.audio_data, mix)
+            # Safe reassignment
             self.processed_audio = new_audio
         except Exception as e:
-            pass
+            self.status_msg = f"DSP Error: {str(e)}"
 
     def request_reprocessing(self):
         import threading
@@ -288,6 +289,10 @@ class GaiaTUI:
             outdata.fill(0)
             return
         
+        # Safe playback looping check
+        if self.play_idx >= self.processed_audio.shape[1]:
+            self.play_idx = 0
+
         end_idx = min(self.play_idx + frames, self.processed_audio.shape[1])
         n = end_idx - self.play_idx
         if n > 0:
@@ -445,6 +450,10 @@ class GaiaTUI:
             
         # Depth 2: Either Module Parameter or Band Gain
         modules_list = self.get_column_data(2)
+        
+        # Strictly clamp selected_module_idx to prevent IndexError from GA removals
+        self.selected_module_idx = max(-1, min(self.selected_module_idx, len(modules_list) - 1))
+        
         if self.selected_module_idx == -1 and isinstance(parent, Band):
             return parent.gain
             
@@ -454,7 +463,9 @@ class GaiaTUI:
             # If it's an AudioModule (Band column)
             if hasattr(item, "parameters"):
                 params = list(item.parameters.values())
-                return params[self.selected_param_idx] if self.selected_param_idx < len(params) else None
+                # Strictly clamp selected_param_idx
+                self.selected_param_idx = max(0, min(self.selected_param_idx, max(0, len(params) - 1)))
+                return params[self.selected_param_idx] if len(params) > 0 else None
         
         return None
 

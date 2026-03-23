@@ -28,50 +28,15 @@ class Engine:
     """The core audio engine that maps DNA to DSP."""
     def __init__(self, sample_rate: int = 44100):
         self.sample_rate = sample_rate
-
-    def _map_module(self, module):
-        """Map DNA modules to pedalboard equivalents if possible."""
-        if not pedalboard: return None
-        p = module.parameters
-        
-        if isinstance(module, CompressorModule):
-            return pedalboard.Compressor(
-                threshold_db=p["Threshold"].current_value,
-                ratio=p["Ratio"].current_value,
-                attack_ms=p["Attack"].current_value,
-                release_ms=p["Release"].current_value,
-            )
-        elif isinstance(module, ExpanderModule):
-            return pedalboard.NoiseGate(
-                threshold_db=p["Threshold"].current_value,
-                ratio=p["Ratio"].current_value,
-                attack_ms=p["Attack"].current_value,
-                release_ms=p["Release"].current_value,
-            )
-        elif isinstance(module, ClipperModule):
-            try:
-                return pedalboard.Clipping(threshold_db=p["Threshold"].current_value)
-            except AttributeError: 
-                return None
-        elif isinstance(module, LimiterModule):
-            return pedalboard.Limiter(
-                threshold_db=p["Threshold"].current_value,
-                release_ms=p["Release"].current_value,
-            )
-        elif isinstance(module, ConvolutionModule):
-            # Use a simple impulse for now (no-op)
-            ir = np.zeros(100)
-            ir[0] = 1.0
-            return pedalboard.Convolution(ir, mix=p["Mix"].current_value)
-            
-        return None
+        self.safety_limiter = None
+        if pedalboard:
+            self.safety_limiter = pedalboard.Limiter(threshold_db=-0.1)
 
     def _process_band(self, audio: np.ndarray, band_dna: Band) -> np.ndarray:
         """Process a single band's audio through its module chain and gain."""
         current_audio = audio
         for module in band_dna.modules:
-            # Try to use mapped pedalboard plugin first for efficiency (if we were using a board)
-            # But currently we call module.process which might have custom logic (e.g. Saturation mix)
+            # Call module.process directly
             current_audio = module.process(current_audio, self.sample_rate)
         
         # Apply Band Gain
@@ -114,9 +79,8 @@ class Engine:
         final_audio = self._process_band(summed_audio, mix_dna.post_band)
         
         # 7. Final Limiter to prevent clipping (safety)
-        if pedalboard:
-            limiter = pedalboard.Limiter(threshold_db=-0.1)
-            return limiter.process(final_audio, self.sample_rate)
+        if self.safety_limiter:
+            return self.safety_limiter.process(final_audio, self.sample_rate)
         
         return final_audio
 
