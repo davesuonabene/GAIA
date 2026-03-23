@@ -5,10 +5,31 @@ import time
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
-from typing import List, Any
+from typing import List, Any, Callable, Optional
+from enum import Enum, auto
+from dataclasses import dataclass, field
 
 # Ensure we can import from core and ga
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+from core.metadata import TrackMetadata
+
+class FocusZone(Enum):
+    MENU = auto()
+    POPULATION = auto()
+    BANDS = auto()
+    PLAYBACK = auto()
+
+@dataclass
+class MenuItem:
+    title: str
+    action: Optional[Callable] = None
+    children: List['MenuItem'] = field(default_factory=list)
+
+class HeaderMenu:
+    def __init__(self, items: List[MenuItem] = None):
+        self.items = items or []
+        self.selected_index = 0
+
 
 # Linux-specific imports for terminal management
 try:
@@ -107,6 +128,13 @@ class GaiaTUI:
         self.output_dir = output_dir
         
         # Navigation State
+        self.focus_zone = FocusZone.POPULATION
+        self.header_menu = HeaderMenu(items=[
+            MenuItem(title="File", action=lambda: None),
+            MenuItem(title="Analysis", action=lambda: None),
+            MenuItem(title="Settings", action=lambda: None),
+        ])
+        self.metadata = TrackMetadata()
         self.focus_row = 0 # 0: Population, 1: Bands
         self.selected_mix_idx = 0
         self.selected_file_idx = 0 # Separate index for file browser
@@ -275,10 +303,28 @@ class GaiaTUI:
                 self.edit_buffer += key
             return
 
+        if key == KEY_TAB and self.mode == "EVOLUTION":
+            if self.focus_zone == FocusZone.BANDS:
+                num_bands = len(self.population.mixes[0].bands)
+                if self.selected_band_idx < num_bands - 1:
+                    self.selected_band_idx += 1
+                else:
+                    self.focus_zone = FocusZone.PLAYBACK
+                    self.selected_band_idx = 0
+            else:
+                zones = list(FocusZone)
+                idx = zones.index(self.focus_zone)
+                next_zone = zones[(idx + 1) % len(zones)]
+                self.focus_zone = next_zone
+                if next_zone == FocusZone.BANDS:
+                    self.selected_band_idx = 0
+            return
+
         if key == KEY_SPACE:
             self.toggle_playback()
             return
 
+        # If in FILE_PICKER, handle its inputs directly
         if self.mode == "FILE_PICKER":
             if key == KEY_UP:
                 self.selected_file_idx = (self.selected_file_idx - 1) % max(1, len(self.file_list))
@@ -297,70 +343,103 @@ class GaiaTUI:
                 self.refresh_file_list()
             return
 
-        # Evolution Mode Navigation
-        if key == KEY_TAB:
-            self.focus_row = 1 - self.focus_row
+        # Evolution Global Shortcuts
+        if key == KEY_L:
+            self.mode = "FILE_PICKER"
+            self.refresh_file_list()
+            return
         elif key == KEY_BRACKET_LEFT:
             self.selected_band_idx = (self.selected_band_idx - 1) % len(self.population.mixes[0].bands)
             self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
         elif key == KEY_BRACKET_RIGHT:
             self.selected_band_idx = (self.selected_band_idx + 1) % len(self.population.mixes[0].bands)
             self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
-        elif key == KEY_L:
-            self.mode = "FILE_PICKER"
-            self.refresh_file_list()
-            return
 
-        if self.focus_row == 0:
-            if key == KEY_LEFT:
-                self.selected_mix_idx = (self.selected_mix_idx - 1) % len(self.population.mixes)
-                if self.is_playing: self.request_reprocessing()
-            elif key == KEY_RIGHT:
-                self.selected_mix_idx = (self.selected_mix_idx + 1) % len(self.population.mixes)
-                if self.is_playing: self.request_reprocessing()
-            elif key == KEY_ENTER:
-                self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
-                if self.is_playing: self.request_reprocessing()
-        else:
-            mix = self.population.mixes[self.selected_mix_idx % len(self.population.mixes)]
-            band = mix.bands[self.selected_band_idx]
-            if key == KEY_UP:
-                if self.selected_param_idx > 0:
-                    self.selected_param_idx -= 1
-                elif self.selected_module_idx > 0:
-                    self.selected_module_idx -= 1
-                    self.selected_param_idx = len(band.modules[self.selected_module_idx].parameters) - 1
-                elif not self.editing_crossover:
-                    self.editing_crossover = True
-            elif key == KEY_DOWN:
-                if self.editing_crossover:
-                    self.editing_crossover = False
-                    self.selected_module_idx = 0
+        if self.focus_zone == FocusZone.MENU:
+            self._handle_menu_input(key)
+        elif self.focus_zone == FocusZone.POPULATION:
+            self._handle_population_input(key)
+        elif self.focus_zone == FocusZone.BANDS:
+            self._handle_bands_input(key)
+        elif self.focus_zone == FocusZone.PLAYBACK:
+            self._handle_playback_input(key)
+
+    def _handle_menu_input(self, key: str):
+        if not self.header_menu.items: return
+        if key == KEY_LEFT:
+            self.header_menu.selected_index = (self.header_menu.selected_index - 1) % len(self.header_menu.items)
+        elif key == KEY_RIGHT:
+            self.header_menu.selected_index = (self.header_menu.selected_index + 1) % len(self.header_menu.items)
+        elif key == KEY_ENTER:
+            item = self.header_menu.items[self.header_menu.selected_index]
+            if item.action:
+                item.action()
+
+    def _handle_playback_input(self, key: str):
+        if key == KEY_LEFT:
+            if self.sample_rate:
+                self.play_idx = max(0, self.play_idx - self.sample_rate)
+        elif key == KEY_RIGHT:
+            if self.sample_rate and self.processed_audio is not None:
+                self.play_idx = min(self.processed_audio.shape[1] - 1, self.play_idx + self.sample_rate)
+
+    def _handle_population_input(self, key: str):
+        if key == KEY_LEFT:
+            self.selected_mix_idx = (self.selected_mix_idx - 1) % len(self.population.mixes)
+            if self.is_playing: self.request_reprocessing()
+        elif key == KEY_RIGHT:
+            self.selected_mix_idx = (self.selected_mix_idx + 1) % len(self.population.mixes)
+            if self.is_playing: self.request_reprocessing()
+        elif key == KEY_ENTER:
+            self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
+            if self.is_playing: self.request_reprocessing()
+
+    def _handle_bands_input(self, key: str):
+        mix = self.population.mixes[self.selected_mix_idx % len(self.population.mixes)]
+        band = mix.bands[self.selected_band_idx]
+        if key == KEY_UP:
+            if self.selected_param_idx > 0:
+                self.selected_param_idx -= 1
+            elif self.selected_module_idx > 0:
+                self.selected_module_idx -= 1
+                self.selected_param_idx = len(band.modules[self.selected_module_idx].parameters) - 1
+            elif not self.editing_crossover:
+                self.editing_crossover = True
+        elif key == KEY_DOWN:
+            if self.editing_crossover:
+                self.editing_crossover = False
+                self.selected_module_idx = 0
+                self.selected_param_idx = 0
+            elif band.modules:
+                mod = band.modules[self.selected_module_idx]
+                if self.selected_param_idx < len(mod.parameters) - 1:
+                    self.selected_param_idx += 1
+                elif self.selected_module_idx < len(band.modules) - 1:
+                    self.selected_module_idx += 1
                     self.selected_param_idx = 0
-                elif band.modules:
-                    mod = band.modules[self.selected_module_idx]
-                    if self.selected_param_idx < len(mod.parameters) - 1:
-                        self.selected_param_idx += 1
-                    elif self.selected_module_idx < len(band.modules) - 1:
-                        self.selected_module_idx += 1
-                        self.selected_param_idx = 0
-            elif key == KEY_LEFT:
-                self.adjust_value(-1)
-            elif key == KEY_RIGHT:
-                self.adjust_value(1)
-            elif key == KEY_ENTER:
-                p = self.get_selected_param()
-                if p:
-                    self.editing = True
-                    self.edit_buffer = str(round(p.current_value, 2))
+        elif key == KEY_LEFT:
+            self.adjust_value(-1)
+        elif key == KEY_RIGHT:
+            self.adjust_value(1)
+        elif key == KEY_ENTER:
+            p = self.get_selected_param()
+            if p:
+                self.editing = True
+                self.edit_buffer = str(round(p.current_value, 2))
 
     def render(self):
         # Build the UI Layout dynamically to avoid out-of-bounds rendering
         layout = Layout()
         
         # Common Header and Status
+        menu_texts = []
+        for i, item in enumerate(self.header_menu.items):
+            style = "bold white on blue" if (self.focus_zone == FocusZone.MENU and i == self.header_menu.selected_index) else "white"
+            menu_texts.append(Text(f" [{item.title}] ", style=style))
+            
         header_text = Text(f"GAIA GENMIX | Gen {self.population.generation_count}", style="bold magenta", justify="center")
-        header_panel = Panel(header_text, box=box.DOUBLE)
+        header_content = Columns([header_text] + menu_texts, expand=True, align="center")
+        header_panel = Panel(header_content, box=box.DOUBLE, border_style="magenta" if self.focus_zone == FocusZone.MENU else "dim")
         status_panel = Panel(Text(self.status_msg, style="bold yellow" if self.editing else "italic green"), box=box.SIMPLE)
 
         if self.mode == "FILE_PICKER":
@@ -397,12 +476,12 @@ class GaiaTUI:
             # 1. Population Row
             mix_texts = []
             for i in range(len(self.population.mixes)):
-                is_sel = (self.focus_row == 0 and i == self.selected_mix_idx)
+                is_sel = (self.focus_zone == FocusZone.POPULATION and i == self.selected_mix_idx)
                 prefix = "▶ " if is_sel else "  "
                 style = "bold white on blue" if is_sel else "white" if i == self.selected_mix_idx else "dim"
                 mix_texts.append(Text(f"{prefix}Mix {i}", style=style))
                 
-            pop_panel = Panel(Columns(mix_texts, expand=True, align="center"), title="Population", border_style="magenta" if self.focus_row == 0 else "dim")
+            pop_panel = Panel(Columns(mix_texts, expand=True, align="center"), title="Population", border_style="magenta" if (self.focus_zone == FocusZone.POPULATION) else "dim")
 
             # 2. Bands Row (using a horizontal layout to prevent wrapping)
             idx = self.selected_mix_idx % len(self.population.mixes)
@@ -411,7 +490,7 @@ class GaiaTUI:
             band_layout.split_row(*[Layout(name=f"band_{i}") for i in range(len(mix.bands))])
             
             for i, band in enumerate(mix.bands):
-                is_band_sel = (self.focus_row == 1 and self.selected_band_idx == i)
+                is_band_sel = (self.focus_zone == FocusZone.BANDS and self.selected_band_idx == i)
                 items = []
                 
                 # Crossover rendering
@@ -421,10 +500,10 @@ class GaiaTUI:
                     txt = self.edit_buffer if (is_xo_sel and self.editing) else f"{xo.current_value:.0f}"
                     style = "bold black on yellow" if (is_xo_sel and self.editing) else "bold white on blue" if is_xo_sel else "cyan"
                     items.append(Text(f"XO: {txt}Hz", style=style, overflow="ellipsis", no_wrap=True))
-                    items.append(Text("-" * 10, style="dim"))
+                    items.append(Text("-" * 10, style="dim", no_wrap=True))
                 else:
                     items.append(Text("XO: Nyq", style="dim", overflow="ellipsis", no_wrap=True))
-                    items.append(Text("-" * 10, style="dim"))
+                    items.append(Text("-" * 10, style="dim", no_wrap=True))
 
                 # Modules rendering
                 for m_idx, mod in enumerate(band.modules):
@@ -440,7 +519,7 @@ class GaiaTUI:
                         style = "bold black on yellow" if (is_p_sel and self.editing) else "bold white on cyan" if is_p_sel else "dim"
                         items.append(Text(f" {short_name}: {val_txt}", style=style, overflow="ellipsis", no_wrap=True))
                         
-                band_panel = Panel(Group(*items), title=f"B{i+1}", border_style="blue" if is_band_sel else "dim")
+                band_panel = Panel(Group(*items), title=f"B{i+1}", border_style="blue" if (self.focus_zone == FocusZone.BANDS and is_band_sel) else "dim")
                 band_layout[f"band_{i}"].update(band_panel)
 
             # 3. Audio Progress Row
@@ -449,9 +528,9 @@ class GaiaTUI:
                 pct = (elapsed / self.playback_duration) * 100 if self.playback_duration > 0 else 0
                 prog_text = Text(f"Play: {elapsed:.1f}s", style="bold cyan")
                 prog_bar = ProgressBar(total=100, completed=pct)
-                audio_panel = Panel(Columns([prog_text, prog_bar], expand=True), title="Audio", border_style="green")
+                audio_panel = Panel(Columns([prog_text, prog_bar], expand=True), title="Audio", border_style="green" if self.focus_zone == FocusZone.PLAYBACK else "dim")
             else:
-                audio_panel = Panel(Text("Stopped", style="dim"), title="Audio", border_style="dim")
+                audio_panel = Panel(Text("Stopped", style="dim"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
 
             # Final Assembly of Evolution mode
             layout.split_column(
@@ -492,16 +571,30 @@ def main():
     with TerminalMode() as term:
         # Use Rich Live to render the UI. Set auto_refresh=False to avoid background thread issues.
         with Live(screen=True, auto_refresh=False) as live:
+            last_render_time = 0
             while tui.running:
-                # Update the display layout and refresh
-                live.update(tui.render(), refresh=True)
-                
-                # Check for keyboard input non-blocking
-                key = get_key(term.fd)
-                if key == KEY_CTRL_C:
+                try:
+                    # Throttle render updates to ~15 FPS to prevent terminal overflow/looping
+                    current_time = time.time()
+                    if current_time - last_render_time > 1.0 / 15.0:
+                        live.update(tui.render(), refresh=True)
+                        last_render_time = current_time
+                    
+                    # Check for keyboard input non-blocking
+                    key = get_key(term.fd)
+                    if key == KEY_CTRL_C:
+                        tui.running = False
+                    elif key:
+                        tui.navigate(key)
+                        # Force immediate render on user input
+                        live.update(tui.render(), refresh=True)
+                        last_render_time = time.time()
+                        
+                except Exception as e:
+                    import traceback
+                    with open("crash.log", "w") as f:
+                        traceback.print_exc(file=f)
                     tui.running = False
-                elif key:
-                    tui.navigate(key)
                 
                 # Prevent CPU spin
                 time.sleep(0.01)
