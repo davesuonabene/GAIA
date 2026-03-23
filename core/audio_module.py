@@ -111,6 +111,55 @@ class SaturationModule(AudioModule):
         distorted = dist.process(audio, sample_rate)
         return (mix * distorted) + ((1.0 - mix) * audio)
 
+class ClipperModule(AudioModule):
+    """A Clipper module implementation."""
+    def __init__(self):
+        super().__init__("Clipper")
+        self.add_parameter(Parameter("Threshold", 0.0, -60.0, 0.0, 5.0))
+        self.add_parameter(Parameter("Softness", 0.0, 0.0, 1.0, 0.1))
+
+    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not pedalboard: return audio
+        # Using pedalboard.Clipping if available, otherwise Distortion
+        try:
+            clipper = pedalboard.Clipping(threshold_db=self.parameters["Threshold"].current_value)
+            return clipper.process(audio, sample_rate)
+        except AttributeError:
+            # Fallback to a simple hard clip using numpy if pedalboard.Clipping is missing
+            threshold_db = self.parameters["Threshold"].current_value
+            threshold_linear = 10 ** (threshold_db / 20.0)
+            return np.clip(audio, -threshold_linear, threshold_linear)
+
+class LimiterModule(AudioModule):
+    """A Limiter module implementation."""
+    def __init__(self):
+        super().__init__("Limiter")
+        self.add_parameter(Parameter("Threshold", 0.0, -60.0, 0.0, 5.0))
+        self.add_parameter(Parameter("Release", 100.0, 1.0, 1000.0, 10.0))
+
+    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not pedalboard: return audio
+        p = self.parameters
+        limiter = pedalboard.Limiter(
+            threshold_db=p["Threshold"].current_value,
+            release_ms=p["Release"].current_value,
+        )
+        return limiter.process(audio, sample_rate)
+
+class ConvolutionModule(AudioModule):
+    """A Convolution module implementation."""
+    def __init__(self):
+        super().__init__("Convolution")
+        self.add_parameter(Parameter("Mix", 0.0, 0.0, 1.0, 0.1))
+
+    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not pedalboard: return audio
+        # Default IR: a single impulse (no-op)
+        ir = np.zeros(100)
+        ir[0] = 1.0
+        conv = pedalboard.Convolution(ir, mix=self.parameters["Mix"].current_value)
+        return conv.process(audio, sample_rate)
+
 
 if __name__ == "__main__":
     # --- SAFE SPAWN VERIFICATION ---

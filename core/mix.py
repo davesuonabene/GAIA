@@ -14,6 +14,9 @@ class Mix:
         Initializes a Mix with the given crossover frequencies.
         Crossovers are stored as evolvable Parameter objects.
         """
+        self.pre_band = Band("PRE")
+        self.post_band = Band("POST")
+        
         self.crossover_params: List[Parameter] = []
         for i, freq in enumerate(sorted(crossovers)):
             # Crossovers can range from 20Hz to 20kHz, with a 10% drift range.
@@ -60,16 +63,18 @@ class Mix:
         # Sort and rename crossover parameters to maintain band order
         self.sort_crossovers()
         
-        # 2. Mutate bands
-        for band in self.bands:
+        # 2. Mutate bands (PRE, POST, and individual frequency bands)
+        for band in [self.pre_band] + self.bands + [self.post_band]:
             band.mutate_structure(structural_mutation_rate)
             band.mutate_parameters(parametric_mutation_rate)
 
     def __repr__(self) -> str:
         c_info = ", ".join([f"{f:.1f}" for f in self.crossover_frequencies])
         mix_info = f"Mix Graph | Crossovers: [{c_info}] Hz\n"
+        pre_info = f"  {self.pre_band}\n"
         band_info = "\n".join([f"  {band}" for band in self.bands])
-        return mix_info + band_info
+        post_info = f"\n  {self.post_band}"
+        return mix_info + pre_info + band_info + post_info
 
 if __name__ == "__main__":
     # --- CROSSOVER EVOLUTION TEST ---

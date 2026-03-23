@@ -51,8 +51,12 @@ from rich.table import Table
 from rich.progress import ProgressBar
 
 from core.mix import Mix
+from core.band import Band
 from ga.population import Population
-from core.audio_module import CompressorModule, ExpanderModule, TransientShaperModule, SaturationModule
+from core.audio_module import (
+    CompressorModule, ExpanderModule, TransientShaperModule, 
+    SaturationModule, ClipperModule, LimiterModule, ConvolutionModule
+)
 from audio.engine import Engine
 
 # Constants
@@ -60,6 +64,12 @@ KEY_UP = "UP"
 KEY_DOWN = "DOWN"
 KEY_RIGHT = "RIGHT"
 KEY_LEFT = "LEFT"
+KEY_SHIFT_UP = "SHIFT_UP"
+KEY_SHIFT_DOWN = "SHIFT_DOWN"
+KEY_CTRL_UP = "CTRL_UP"
+KEY_CTRL_DOWN = "CTRL_DOWN"
+KEY_CTRL_RIGHT = "CTRL_RIGHT"
+KEY_CTRL_LEFT = "CTRL_LEFT"
 KEY_ENTER = "ENTER"
 KEY_TAB = "TAB"
 KEY_CTRL_C = "CTRL_C"
@@ -69,6 +79,9 @@ KEY_BACKSPACE = "BACKSPACE"
 KEY_L = "L"
 KEY_E = "E"
 KEY_P = "P"
+KEY_M = "M"
+KEY_S = "S"
+KEY_K = "K"
 KEY_BRACKET_LEFT = "["
 KEY_BRACKET_RIGHT = "]"
 
@@ -101,10 +114,22 @@ def get_key(fd):
     except EOFError:
         return None
 
+    # Escape sequences
     if b == b'\x1b[A': return KEY_UP
     if b == b'\x1b[B': return KEY_DOWN
     if b == b'\x1b[C': return KEY_RIGHT
     if b == b'\x1b[D': return KEY_LEFT
+    
+    # SHIFT sequences
+    if b == b'\x1b[1;2A': return KEY_SHIFT_UP
+    if b == b'\x1b[1;2B': return KEY_SHIFT_DOWN
+
+    # CTRL sequences
+    if b == b'\x1b[1;5A': return KEY_CTRL_UP
+    if b == b'\x1b[1;5B': return KEY_CTRL_DOWN
+    if b == b'\x1b[1;5C': return KEY_CTRL_RIGHT
+    if b == b'\x1b[1;5D': return KEY_CTRL_LEFT
+    
     if b == b'\x1b': return KEY_ESC
     if b in (b'\r', b'\n'): return KEY_ENTER
     if b == b'\t': return KEY_TAB
@@ -116,6 +141,9 @@ def get_key(fd):
         decoded = b.decode('ascii').upper()
         if decoded == '[': return KEY_BRACKET_LEFT
         if decoded == ']': return KEY_BRACKET_RIGHT
+        if decoded == 'M': return KEY_M
+        if decoded == 'S': return KEY_S
+        if decoded == 'K': return KEY_K
         return decoded
     except Exception:
         return None
@@ -143,6 +171,10 @@ class GaiaTUI:
         self.selected_param_idx = 0
         self.editing_crossover = False
         
+        # FX Selection Mode
+        self.selecting_new_fx = False
+        self.available_fx_pool = []
+        
         self.running = True
         self.engine = Engine(sample_rate=self.sample_rate) if self.sample_rate else None
         self.is_playing = False
@@ -167,7 +199,7 @@ class GaiaTUI:
         # Inline Editing State
         self.editing = False
         self.edit_buffer = ""
-        self.status_msg = "Arrows: Navigate/Adjust | TAB: Row | [ ]: Band | ENTER: Edit | SPACE: Play/Stop"
+        self.status_msg = "Arrows: Navigate/Adjust | TAB: Zone | CTRL+Arrows: Granular/Jump | SPACE: Play/Stop"
 
     def refresh_file_list(self):
         """Scans path for audio files."""
@@ -252,10 +284,13 @@ class GaiaTUI:
                 self.reprocess_audio_task() # Initial synchronous process
                 self.playback_duration = self.processed_audio.shape[1] / self.sample_rate
                 
+                # Low-latency settings for Pipewire/Linux
+                # A blocksize of 256 or 512 is standard for real-time response
                 self.stream = sd.OutputStream(
                     samplerate=self.sample_rate, 
                     channels=self.processed_audio.shape[0], 
-                    callback=self.audio_callback
+                    callback=self.audio_callback,
+                    blocksize=512
                 )
                 self.stream.start()
                 self.is_playing = True
@@ -263,39 +298,263 @@ class GaiaTUI:
             except Exception as e:
                 self.status_msg = f"Error: {e}"
 
-    def get_selected_param(self):
-        if self.mode != "EVOLUTION": return None
+    def get_column_data(self, depth: int) -> List[Any]:
+        """Returns the data list for a specific depth in the navigation tree."""
         idx = self.selected_mix_idx % len(self.population.mixes)
         mix = self.population.mixes[idx]
+        
+        if depth == 1:
+            # Tree conceptually: [pre_band, ...bands, post_band]
+            return [mix.pre_band] + mix.bands + [mix.post_band]
+        
+        if depth == 2:
+            # Check if we are in FX selection mode
+            if self.selecting_new_fx:
+                return self.available_fx_pool
+
+            # Get the focused item at depth 1
+            all_d1 = self.get_column_data(1)
+            if self.selected_band_idx < len(all_d1):
+                parent = all_d1[self.selected_band_idx]
+                if isinstance(parent, Band):
+                    # Band FX Chain + Dummy [+] Button
+                    return parent.modules + ["[+] Add FX"]
+        return []
+
+    def render_column_content(self, column_data: List[Any], depth: int, is_focused: bool = False) -> Group:
+        """Renders the content of a column for display in Depth 2 (Modules list)."""
+        items = []
+        
+        if depth == 2:
+            if self.selecting_new_fx and is_focused:
+                items.append(Text(" SELECT FX TO ADD: ", style="bold white on green"))
+                items.append(Text("-" * 20, style="dim"))
+
+            for m_idx, item in enumerate(column_data):
+                is_mod_sel = is_focused and (not self.editing_crossover) and self.selected_module_idx == m_idx
+                
+                # Handling Class types (for selection mode)
+                if isinstance(item, type):
+                    name = item().name.upper() # Safe spawn just for name
+                    style = "bold white on green" if is_mod_sel else "green"
+                    items.append(Text(f" > {name}", style=style))
+                    continue
+
+                # Resilience: handle dummy string [+] Add FX
+                if isinstance(item, str):
+                    style = "bold green" if is_mod_sel else "green"
+                    items.append(Text(f" {item}", style=style))
+                    continue
+                
+                # Resilience: handle Crossover parameters
+                from core.parameter import Parameter
+                if isinstance(item, Parameter):
+                    # For crossovers, we just show the name and value
+                    val_txt = self.edit_buffer if (is_mod_sel and self.editing) else f"{item.current_value:.0f}Hz"
+                    if item.is_locked: val_txt = f"*{val_txt}"
+                    style = "bold black on yellow" if (is_mod_sel and self.editing) else "bold white on cyan" if is_mod_sel else "dim"
+                    items.append(Text(f" {item.name}: {val_txt}", style=style))
+                    continue
+
+                # Normal AudioModule rendering
+                mod_name = item.name.upper()
+                style = "bold white on blue" if is_mod_sel else "white"
+                items.append(Text(f"[{mod_name}]", style=style, no_wrap=True))
+                
+                # Render parameters
+                for p_idx, (p_name, p) in enumerate(item.parameters.items()):
+                    is_p_sel = is_mod_sel and self.selected_param_idx == p_idx
+                    val_txt = self.edit_buffer if (is_p_sel and self.editing) else f"{p.current_value:.1f}"
+                    if p.is_locked: val_txt = f"*{val_txt}"
+                    p_style = "bold black on yellow" if (is_p_sel and self.editing) else "bold white on cyan" if is_p_sel else "dim"
+                    items.append(Align.right(Text(f" {p_name}: {val_txt}", style=p_style, overflow="ellipsis", no_wrap=True)))
+        
+        return Group(*items)
+
+    def get_selected_param(self):
+        if self.mode != "EVOLUTION" or self.selecting_new_fx: return None
+        idx = self.selected_mix_idx % len(self.population.mixes)
+        mix = self.population.mixes[idx]
+        
+        # New logic using get_column_data (Depth 1)
+        cols = self.get_column_data(1)
+        if self.selected_band_idx >= len(cols): return None
+        parent = cols[self.selected_band_idx]
+        
+        # Check if we are on a frequency crossover
         if self.editing_crossover:
-            return mix.crossover_params[self.selected_band_idx] if self.selected_band_idx < len(mix.crossover_params) else None
-        band = mix.bands[self.selected_band_idx]
-        if band.modules and self.selected_module_idx < len(band.modules):
-            mod = band.modules[self.selected_module_idx]
-            params = list(mod.parameters.values())
-            return params[self.selected_param_idx] if self.selected_param_idx < len(params) else None
+            if 1 <= self.selected_band_idx <= len(mix.crossover_params):
+                xo_idx = self.selected_band_idx - 1
+                return mix.crossover_params[xo_idx]
+            else:
+                self.editing_crossover = False # Auto-correct if on wrong band
+                return None
+            
+        # Depth 2: Either Module Parameter or Band Gain
+        modules_list = self.get_column_data(2)
+        if self.selected_module_idx == -1 and isinstance(parent, Band):
+            return parent.gain
+            
+        if 0 <= self.selected_module_idx < len(modules_list):
+            item = modules_list[self.selected_module_idx]
+            
+            # If it's an AudioModule (Band column)
+            if hasattr(item, "parameters"):
+                params = list(item.parameters.values())
+                return params[self.selected_param_idx] if self.selected_param_idx < len(params) else None
+        
         return None
 
-    def adjust_value(self, direction: int):
+    def adjust_value(self, direction: int, granular: bool = False):
         p = self.get_selected_param()
-        if p:
+        if not p: return
+
+        idx = self.selected_mix_idx % len(self.population.mixes)
+        mix = self.population.mixes[idx]
+        
+        # Exponential scaling for crossovers: logarithmic frequency navigation
+        if p in mix.crossover_params:
+            # Factor for 2% change (standard) or 0.2% change (granular)
+            # This ensures sub-hertz precision in the lows (e.g., 0.4Hz steps at 20Hz)
+            # and natural octave-based navigation in the highs.
+            factor = 1.02 if not granular else 1.002
+            
+            if direction > 0:
+                new_value = p.current_value * factor
+            else:
+                new_value = p.current_value / factor
+            
+            # Dynamic bounds based on neighbors
+            sorted_xo = sorted(mix.crossover_params, key=lambda x: x.current_value)
+            p_idx = sorted_xo.index(p)
+            
+            # Use small buffer to avoid total collapse
+            dyn_min = sorted_xo[p_idx - 1].current_value + 0.1 if p_idx > 0 else p.min_bound
+            dyn_max = sorted_xo[p_idx + 1].current_value - 0.1 if p_idx < len(sorted_xo) - 1 else p.max_bound
+            
+            p.current_value = max(dyn_min, min(dyn_max, new_value))
+            mix.sort_crossovers()
+        else:
+            # Normal linear parameter adjustment for other DSP modules
             step = (p.max_bound - p.min_bound) * 0.05 * direction
+            if granular:
+                step /= 5.0
             p.current_value = max(p.min_bound, min(p.max_bound, p.current_value + step))
-            if self.editing_crossover: 
-                idx = self.selected_mix_idx % len(self.population.mixes)
-                self.population.mixes[idx].sort_crossovers()
-            if self.is_playing:
-                self.request_reprocessing()
+            
+        # Refresh engine if playing
+        if self.is_playing:
+            self.request_reprocessing()
 
     def set_value(self, val: float):
         p = self.get_selected_param()
-        if p:
+        if not p: return
+
+        # Get context for crossovers
+        idx = self.selected_mix_idx % len(self.population.mixes)
+        mix = self.population.mixes[idx]
+
+        if p in mix.crossover_params:
+            sorted_xo = sorted(mix.crossover_params, key=lambda x: x.current_value)
+            p_idx = sorted_xo.index(p)
+            
+            # Dynamic bounds based on neighbors
+            dyn_min = sorted_xo[p_idx - 1].current_value + 1.0 if p_idx > 0 else p.min_bound
+            dyn_max = sorted_xo[p_idx + 1].current_value - 1.0 if p_idx < len(sorted_xo) - 1 else p.max_bound
+            
+            # Revert if out of dynamic range
+            if val < dyn_min or val > dyn_max:
+                self.status_msg = f"Value out of band range! Allowed: {dyn_min:.0f}-{dyn_max:.0f} Hz"
+                return
+            
+            p.current_value = val
+            mix.sort_crossovers()
+        else:
+            # Normal parameter set
             p.current_value = max(p.min_bound, min(p.max_bound, val))
+            
+        if self.is_playing:
+            self.request_reprocessing()
+
+    def execute_action(self):
+        """Executes the primary action (ENTER) based on the current focus."""
+        if self.mode == "FILE_PICKER":
+            if self.file_list:
+                item = self.file_list[self.selected_file_idx]
+                if item["type"] == "dir":
+                    self.current_path = os.path.abspath(os.path.join(self.current_path, item["name"]))
+                    self.refresh_file_list()
+                else:
+                    self.load_audio(item["name"])
+            return
+
+        if self.focus_zone == FocusZone.MENU:
+            item = self.header_menu.items[self.header_menu.selected_index]
+            if item.action:
+                item.action()
+            return
+
+        if self.focus_zone == FocusZone.POPULATION:
+            # Evolve selected parent
+            self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
+            if self.is_playing: self.request_reprocessing()
+            return
+
+        if self.focus_zone == FocusZone.BANDS:
+            # Handle confirming FX selection
+            if self.selecting_new_fx:
+                idx = self.selected_module_idx
+                if 0 <= idx < len(self.available_fx_pool):
+                    cols = self.get_column_data(1)
+                    band = cols[self.selected_band_idx]
+                    if isinstance(band, Band):
+                        selected_cls = self.available_fx_pool[idx]
+                        new_mod = selected_cls()
+                        band.modules.append(new_mod)
+                        self.status_msg = f"Added {new_mod.name} to {band.name}"
+                        if self.is_playing: self.request_reprocessing()
+                
+                self.selecting_new_fx = False
+                self.selected_module_idx = 0
+                return
+
             if self.editing_crossover:
-                idx = self.selected_mix_idx % len(self.population.mixes)
-                self.population.mixes[idx].sort_crossovers()
-            if self.is_playing:
-                self.request_reprocessing()
+                p = self.get_selected_param()
+                if p:
+                    self.editing = True
+                    self.edit_buffer = str(round(p.current_value, 2))
+                return
+
+            modules_list = self.get_column_data(2)
+            if 0 <= self.selected_module_idx < len(modules_list):
+                item = modules_list[self.selected_module_idx]
+                
+                # Enter selection mode when [+] Add FX button is clicked
+                if item == "[+] Add FX":
+                    cols = self.get_column_data(1)
+                    band = cols[self.selected_band_idx]
+                    if isinstance(band, Band):
+                        # Pool of all available modules (classes)
+                        module_pool = [
+                            CompressorModule, ExpanderModule, TransientShaperModule, 
+                            SaturationModule, ClipperModule, LimiterModule, ConvolutionModule
+                        ]
+                        existing_classes = {type(m) for m in band.modules}
+                        available = [cls for cls in module_pool if cls not in existing_classes]
+                        
+                        if available:
+                            self.selecting_new_fx = True
+                            self.available_fx_pool = available
+                            self.selected_module_idx = 0
+                            self.status_msg = "Select effect to add..."
+                        else:
+                            self.status_msg = "Band is full! Cannot add more FX."
+                    return
+            
+            # Default action: Inline Parameter Editing
+            p = self.get_selected_param()
+            if p:
+                self.editing = True
+                self.edit_buffer = str(round(p.current_value, 2))
 
     def navigate(self, key: str):
         if self.editing:
@@ -311,41 +570,51 @@ class GaiaTUI:
                 self.edit_buffer += key
             return
 
+        if self.selecting_new_fx:
+            if key == KEY_ESC:
+                self.selecting_new_fx = False
+                self.status_msg = "Cancelled FX addition."
+                return
+            elif key == KEY_ENTER:
+                self.execute_action()
+                return
+
         if key == KEY_TAB and self.mode == "EVOLUTION":
-            if self.focus_zone == FocusZone.BANDS:
-                num_bands = len(self.population.mixes[0].bands)
-                if self.selected_band_idx < num_bands - 1:
-                    self.selected_band_idx += 1
-                else:
-                    self.focus_zone = FocusZone.PLAYBACK
-                    self.selected_band_idx = 0
-            else:
-                zones = list(FocusZone)
-                idx = zones.index(self.focus_zone)
-                next_zone = zones[(idx + 1) % len(zones)]
-                self.focus_zone = next_zone
-                if next_zone == FocusZone.BANDS:
-                    self.selected_band_idx = 0
+            zones = [FocusZone.MENU, FocusZone.POPULATION, FocusZone.BANDS, FocusZone.PLAYBACK]
+            idx = zones.index(self.focus_zone)
+            self.focus_zone = zones[(idx + 1) % len(zones)]
+            self.selecting_new_fx = False # Exit selection mode when switching zones
             return
 
         if key == KEY_SPACE:
             self.toggle_playback()
             return
 
-        # If in FILE_PICKER, handle its inputs directly
+        if key == KEY_ENTER:
+            self.execute_action()
+            return
+
+        # Mix Sorting logic (Depth 0 = FocusZone.POPULATION)
+        if self.focus_zone == FocusZone.POPULATION:
+            if key == KEY_SHIFT_UP:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                prev_idx = (idx - 1) % len(self.population.mixes)
+                self.population.mixes[idx], self.population.mixes[prev_idx] = self.population.mixes[prev_idx], self.population.mixes[idx]
+                self.selected_mix_idx = prev_idx
+                return
+            elif key == KEY_SHIFT_DOWN:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                next_idx = (idx + 1) % len(self.population.mixes)
+                self.population.mixes[idx], self.population.mixes[next_idx] = self.population.mixes[next_idx], self.population.mixes[idx]
+                self.selected_mix_idx = next_idx
+                return
+
+        # If in FILE_PICKER, handle remaining inputs
         if self.mode == "FILE_PICKER":
             if key == KEY_UP:
                 self.selected_file_idx = (self.selected_file_idx - 1) % max(1, len(self.file_list))
             elif key == KEY_DOWN:
                 self.selected_file_idx = (self.selected_file_idx + 1) % max(1, len(self.file_list))
-            elif key == KEY_ENTER:
-                if self.file_list:
-                    item = self.file_list[self.selected_file_idx]
-                    if item["type"] == "dir":
-                        self.current_path = os.path.abspath(os.path.join(self.current_path, item["name"]))
-                        self.refresh_file_list()
-                    else:
-                        self.load_audio(item["name"])
             elif key == KEY_BACKSPACE:
                 self.current_path = os.path.abspath(os.path.join(self.current_path, ".."))
                 self.refresh_file_list()
@@ -357,11 +626,32 @@ class GaiaTUI:
             self.refresh_file_list()
             return
         elif key == KEY_BRACKET_LEFT:
-            self.selected_band_idx = (self.selected_band_idx - 1) % len(self.population.mixes[0].bands)
+            self.selected_band_idx = (self.selected_band_idx - 1) % len(self.get_column_data(1))
             self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
+            self.selecting_new_fx = False
         elif key == KEY_BRACKET_RIGHT:
-            self.selected_band_idx = (self.selected_band_idx + 1) % len(self.population.mixes[0].bands)
+            self.selected_band_idx = (self.selected_band_idx + 1) % len(self.get_column_data(1))
             self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
+            self.selecting_new_fx = False
+        elif key == KEY_M:
+            cols = self.get_column_data(1)
+            band = cols[self.selected_band_idx]
+            if isinstance(band, Band):
+                band.is_muted = not band.is_muted
+                self.status_msg = f"Band {band.name} {'Muted' if band.is_muted else 'Unmuted'}"
+                if self.is_playing: self.request_reprocessing()
+        elif key == KEY_S:
+            cols = self.get_column_data(1)
+            band = cols[self.selected_band_idx]
+            if isinstance(band, Band):
+                band.is_soloed = not band.is_soloed
+                self.status_msg = f"Band {band.name} {'Soloed' if band.is_soloed else 'Unsoloed'}"
+                if self.is_playing: self.request_reprocessing()
+        elif key == KEY_K:
+            p = self.get_selected_param()
+            if p:
+                p.is_locked = not p.is_locked
+                self.status_msg = f"Param {p.name} {'Locked' if p.is_locked else 'Unlocked'}"
 
         if self.focus_zone == FocusZone.MENU:
             self._handle_menu_input(key)
@@ -378,20 +668,18 @@ class GaiaTUI:
             self.header_menu.selected_index = (self.header_menu.selected_index - 1) % len(self.header_menu.items)
         elif key == KEY_RIGHT:
             self.header_menu.selected_index = (self.header_menu.selected_index + 1) % len(self.header_menu.items)
-        elif key == KEY_ENTER:
-            item = self.header_menu.items[self.header_menu.selected_index]
-            if item.action:
-                item.action()
 
     def _handle_playback_input(self, key: str):
-        if key == KEY_LEFT:
+        if key in (KEY_LEFT, KEY_CTRL_LEFT):
             if self.sample_rate:
-                # Scrub 5s back
-                self.play_idx = max(0, self.play_idx - (5 * self.sample_rate))
-        elif key == KEY_RIGHT:
+                amount = 1 if key == KEY_CTRL_LEFT else 5
+                # Scrub back safely
+                self.play_idx = max(0, self.play_idx - (amount * self.sample_rate))
+        elif key in (KEY_RIGHT, KEY_CTRL_RIGHT):
             if self.sample_rate and self.processed_audio is not None:
-                # Scrub 5s forward
-                self.play_idx = min(self.processed_audio.shape[1] - 1, self.play_idx + (5 * self.sample_rate))
+                amount = 1 if key == KEY_CTRL_RIGHT else 5
+                # Scrub forward safely
+                self.play_idx = min(self.processed_audio.shape[1] - 1, self.play_idx + (amount * self.sample_rate))
 
     def _handle_population_input(self, key: str):
         if key == KEY_LEFT:
@@ -400,42 +688,111 @@ class GaiaTUI:
         elif key == KEY_RIGHT:
             self.selected_mix_idx = (self.selected_mix_idx + 1) % len(self.population.mixes)
             if self.is_playing: self.request_reprocessing()
-        elif key == KEY_ENTER:
-            self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
-            if self.is_playing: self.request_reprocessing()
 
     def _handle_bands_input(self, key: str):
         mix = self.population.mixes[self.selected_mix_idx % len(self.population.mixes)]
-        band = mix.bands[self.selected_band_idx]
+        
+        cols = self.get_column_data(1)
+        if self.selected_band_idx >= len(cols): self.selected_band_idx = 0
+        current_col = cols[self.selected_band_idx]
+        
+        # If selecting new FX, restrict navigation to the pool list
+        if self.selecting_new_fx:
+            if key == KEY_UP:
+                self.selected_module_idx = (self.selected_module_idx - 1) % len(self.available_fx_pool)
+            elif key == KEY_DOWN:
+                self.selected_module_idx = (self.selected_module_idx + 1) % len(self.available_fx_pool)
+            return
+
+        # Special case: Quick compare across columns
+        if key == KEY_CTRL_LEFT:
+            self.selected_band_idx = (self.selected_band_idx - 1) % len(cols)
+            self.editing_crossover = False
+            return
+        elif key == KEY_CTRL_RIGHT:
+            self.selected_band_idx = (self.selected_band_idx + 1) % len(cols)
+            self.editing_crossover = False
+            return
+
         if key == KEY_UP:
+            if self.editing_crossover:
+                return # Topmost element
+                
             if self.selected_param_idx > 0:
                 self.selected_param_idx -= 1
             elif self.selected_module_idx > 0:
                 self.selected_module_idx -= 1
-                self.selected_param_idx = len(band.modules[self.selected_module_idx].parameters) - 1
-            elif not self.editing_crossover:
-                self.editing_crossover = True
+                # Find number of parameters for previous module
+                current_depth2 = self.get_column_data(2)
+                prev_mod = current_depth2[self.selected_module_idx]
+                if hasattr(prev_mod, "parameters"):
+                    self.selected_param_idx = len(prev_mod.parameters) - 1
+                else:
+                    self.selected_param_idx = 0
+            elif self.selected_module_idx == 0:
+                # Move to Band Gain
+                self.selected_module_idx = -1
+                self.selected_param_idx = 0
+            elif self.selected_module_idx == -1:
+                # Move to Crossover Title (if on a frequency band)
+                if 1 <= self.selected_band_idx <= len(mix.crossover_params):
+                    self.editing_crossover = True
+        elif key == KEY_CTRL_UP:
+            if self.editing_crossover:
+                return
+            if self.selected_module_idx > 0:
+                self.selected_module_idx -= 1
+                self.selected_param_idx = 0
+            elif self.selected_module_idx == 0:
+                self.selected_module_idx = -1
+            elif self.selected_module_idx == -1:
+                if 1 <= self.selected_band_idx <= len(mix.crossover_params):
+                    self.editing_crossover = True
         elif key == KEY_DOWN:
             if self.editing_crossover:
                 self.editing_crossover = False
-                self.selected_module_idx = 0
+                self.selected_module_idx = -1
                 self.selected_param_idx = 0
-            elif band.modules:
-                mod = band.modules[self.selected_module_idx]
-                if self.selected_param_idx < len(mod.parameters) - 1:
+                return
+                
+            current_depth2 = self.get_column_data(2)
+            if self.selected_module_idx == -1:
+                if current_depth2:
+                    self.selected_module_idx = 0
+                    self.selected_param_idx = 0
+                return
+
+            if 0 <= self.selected_module_idx < len(current_depth2):
+                mod = current_depth2[self.selected_module_idx]
+                if hasattr(mod, "parameters") and self.selected_param_idx < len(mod.parameters) - 1:
                     self.selected_param_idx += 1
-                elif self.selected_module_idx < len(band.modules) - 1:
+                elif self.selected_module_idx < len(current_depth2) - 1:
                     self.selected_module_idx += 1
                     self.selected_param_idx = 0
+        elif key == KEY_CTRL_DOWN:
+            if self.editing_crossover:
+                self.editing_crossover = False
+                self.selected_module_idx = -1
+                return
+
+            current_depth2 = self.get_column_data(2)
+            if self.selected_module_idx == -1:
+                if current_depth2:
+                    self.selected_module_idx = 0
+                    self.selected_param_idx = 0
+                return
+
+            if self.selected_module_idx < len(current_depth2) - 1:
+                self.selected_module_idx += 1
+                self.selected_param_idx = 0
         elif key == KEY_LEFT:
             self.adjust_value(-1)
         elif key == KEY_RIGHT:
             self.adjust_value(1)
-        elif key == KEY_ENTER:
-            p = self.get_selected_param()
-            if p:
-                self.editing = True
-                self.edit_buffer = str(round(p.current_value, 2))
+        elif key == KEY_CTRL_LEFT: # Redundant but safe
+            self.adjust_value(-1, granular=True)
+        elif key == KEY_CTRL_RIGHT: # Redundant but safe
+            self.adjust_value(1, granular=True)
 
     def render(self):
         # Build the UI Layout dynamically to avoid out-of-bounds rendering
@@ -447,8 +804,9 @@ class GaiaTUI:
             style = "bold white on blue" if (self.focus_zone == FocusZone.MENU and i == self.header_menu.selected_index) else "white"
             menu_texts.append(Text(f" [{item.title}] ", style=style))
             
-        header_text = Text(f"GAIA GENMIX | Gen {self.population.generation_count}", style="bold magenta", justify="center")
-        header_content = Columns([header_text] + menu_texts, expand=True, align="center")
+        header_left = Text(f" GAIA | {self.metadata.filename or '---'}", style="bold magenta")
+        header_gen = Text(f"Gen {self.population.generation_count}", style="bold cyan")
+        header_content = Columns([header_left, header_gen] + menu_texts, expand=True)
         header_panel = Panel(header_content, box=box.DOUBLE, border_style="magenta" if self.focus_zone == FocusZone.MENU else "dim")
         
         # Footer / Status Panel
@@ -497,46 +855,66 @@ class GaiaTUI:
                 style = "bold white on blue" if is_sel else "white" if i == self.selected_mix_idx else "dim"
                 mix_texts.append(Text(f"{prefix}Mix {i}", style=style))
                 
-            pop_panel = Panel(Columns(mix_texts, expand=True, align="center"), title="Population", border_style="magenta" if (self.focus_zone == FocusZone.POPULATION) else "dim")
+            pop_panel = Panel(Columns(mix_texts, expand=True, align="center"), border_style="magenta" if (self.focus_zone == FocusZone.POPULATION) else "dim")
 
-            # 2. Bands Row (using a horizontal layout to prevent wrapping)
+            # 2. Bands Row
             idx = self.selected_mix_idx % len(self.population.mixes)
             mix = self.population.mixes[idx]
-            band_layout = Layout(name="bands")
-            band_layout.split_row(*[Layout(name=f"band_{i}") for i in range(len(mix.bands))])
             
-            for i, band in enumerate(mix.bands):
-                is_band_sel = (self.focus_zone == FocusZone.BANDS and self.selected_band_idx == i)
+            columns = self.get_column_data(1)
+            band_layout = Layout(name="bands")
+            band_layout.split_row(*[Layout(name=f"col_{i}") for i in range(len(columns))])
+            
+            for i, item in enumerate(columns):
+                is_col_focused = (self.focus_zone == FocusZone.BANDS and self.selected_band_idx == i)
+                
+                # Rendering a Band (PRE, POST, or Frequency Band)
+                band = item
                 items = []
                 
-                # Crossover rendering
-                if i < len(mix.crossover_params):
-                    xo = mix.crossover_params[i]
-                    is_xo_sel = is_band_sel and self.editing_crossover
-                    txt = self.edit_buffer if (is_xo_sel and self.editing) else f"{xo.current_value:.0f}"
-                    style = "bold black on yellow" if (is_xo_sel and self.editing) else "bold white on blue" if is_xo_sel else "cyan"
-                    items.append(Text(f"XO: {txt}Hz", style=style, overflow="ellipsis", no_wrap=True))
-                    items.append(Text("-" * 10, style="dim", no_wrap=True))
+                # Mute / Solo indicators
+                ms_text = Text("")
+                if band.is_soloed: ms_text.append("[S]", style="bold black on yellow")
+                if band.is_muted: ms_text.append("[M]", style="bold white on red")
+                if len(ms_text) > 0: items.append(ms_text)
+
+                # Band Title & Crossover logic
+                is_xo_sel = is_col_focused and self.editing_crossover
+                if 1 <= i <= len(mix.crossover_params):
+                    # This is a frequency band (Low, Mid, etc.) with a Crossover
+                    xo = mix.crossover_params[i-1]
+                    txt = self.edit_buffer if (is_xo_sel and self.editing) else f"{xo.current_value:.1f}"
+                    if xo.is_locked: txt = f"*{txt}"
+                    band_title = Text(f"{band.name} | {txt}Hz", style="bold yellow" if is_xo_sel else "cyan")
                 else:
-                    items.append(Text("XO: Nyq", style="dim", overflow="ellipsis", no_wrap=True))
-                    items.append(Text("-" * 10, style="dim", no_wrap=True))
+                    # PRE, POST, or the last frequency band (High/Nyq)
+                    band_title = Text(band.name, style="bold magenta" if (band.name in ["PRE", "POST"]) else "cyan")
+
+                # Band Gain (Subtitle)
+                is_gain_sel = is_col_focused and self.selected_module_idx == -1 and not self.editing_crossover
+                gain_val = self.edit_buffer if (is_gain_sel and self.editing) else f"{band.gain.current_value:.1f}"
+                if band.gain.is_locked: gain_val = f"*{gain_val}"
+                gain_style = "bold black on yellow" if (is_gain_sel and self.editing) else "bold white on blue" if is_gain_sel else "white"
+                band_subtitle = Text(f" {gain_val}dB ", style=gain_style)
 
                 # Modules rendering
-                for m_idx, mod in enumerate(band.modules):
-                    is_mod_sel = is_band_sel and not self.editing_crossover and self.selected_module_idx == m_idx
-                    mod_name = mod.name[:7] + "." if len(mod.name) > 8 else mod.name
-                    style = "bold white on blue" if is_mod_sel else "white"
-                    items.append(Text(f"[{mod_name}]", style=style, overflow="ellipsis", no_wrap=True))
+                # Only the focused band shows the [+] Add FX button to save space and clarify focus
+                if is_col_focused:
+                    modules_to_render = self.get_column_data(2)
+                else:
+                    modules_to_render = band.modules
+                
+                items.append(self.render_column_content(modules_to_render, 2, is_focused=is_col_focused))
                     
-                    for p_idx, (p_name, p) in enumerate(mod.parameters.items()):
-                        is_p_sel = is_mod_sel and self.selected_param_idx == p_idx
-                        val_txt = self.edit_buffer if (is_p_sel and self.editing) else f"{p.current_value:.1f}"
-                        short_name = p_name[:5]
-                        style = "bold black on yellow" if (is_p_sel and self.editing) else "bold white on cyan" if is_p_sel else "dim"
-                        items.append(Text(f" {short_name}: {val_txt}", style=style, overflow="ellipsis", no_wrap=True))
-                        
-                band_panel = Panel(Group(*items), title=f"B{i+1}", border_style="blue" if (self.focus_zone == FocusZone.BANDS and is_band_sel) else "dim")
-                band_layout[f"band_{i}"].update(band_panel)
+                band_panel = Panel(
+                    Group(*items), 
+                    title=band_title,
+                    title_align="right",
+                    subtitle=band_subtitle,
+                    subtitle_align="center",
+                    border_style="blue" if (is_col_focused and not self.editing_crossover) else "yellow" if is_xo_sel else "dim"
+                )
+                band_layout[f"col_{i}"].update(band_panel)
 
             # 3. Audio Progress Row
             elapsed = self.play_idx / self.sample_rate if self.sample_rate else 0
@@ -563,7 +941,7 @@ class GaiaTUI:
             return layout
 
 def main():
-    parser = argparse.ArgumentParser(description="Gaia GenMix TUI")
+    parser = argparse.ArgumentParser(description="GAIA TUI")
     parser.add_argument("input_file", type=str, nargs="?", help="Optional audio file to load on start")
     args = parser.parse_args()
 

@@ -7,48 +7,118 @@ import os
 try:
     from .crossover import Crossover
     from ..core.mix import Mix
-    from ..core.audio_module import CompressorModule
+    from ..core.audio_module import (
+        CompressorModule, ExpanderModule, ClipperModule, 
+        LimiterModule, ConvolutionModule, SaturationModule, TransientShaperModule
+    )
+    from ..core.band import Band
 except (ImportError, ValueError):
     try:
         from audio.crossover import Crossover
     except ImportError:
         from crossover import Crossover
     from core.mix import Mix
-    from core.audio_module import CompressorModule
+    from core.audio_module import (
+        CompressorModule, ExpanderModule, ClipperModule, 
+        LimiterModule, ConvolutionModule, SaturationModule, TransientShaperModule
+    )
+    from core.band import Band
 
 class Engine:
     """The core audio engine that maps DNA to DSP."""
     def __init__(self, sample_rate: int = 44100):
         self.sample_rate = sample_rate
 
+    def _map_module(self, module):
+        """Map DNA modules to pedalboard equivalents if possible."""
+        if not pedalboard: return None
+        p = module.parameters
+        
+        if isinstance(module, CompressorModule):
+            return pedalboard.Compressor(
+                threshold_db=p["Threshold"].current_value,
+                ratio=p["Ratio"].current_value,
+                attack_ms=p["Attack"].current_value,
+                release_ms=p["Release"].current_value,
+            )
+        elif isinstance(module, ExpanderModule):
+            return pedalboard.NoiseGate(
+                threshold_db=p["Threshold"].current_value,
+                ratio=p["Ratio"].current_value,
+                attack_ms=p["Attack"].current_value,
+                release_ms=p["Release"].current_value,
+            )
+        elif isinstance(module, ClipperModule):
+            try:
+                return pedalboard.Clipping(threshold_db=p["Threshold"].current_value)
+            except AttributeError: 
+                return None
+        elif isinstance(module, LimiterModule):
+            return pedalboard.Limiter(
+                threshold_db=p["Threshold"].current_value,
+                release_ms=p["Release"].current_value,
+            )
+        elif isinstance(module, ConvolutionModule):
+            # Use a simple impulse for now (no-op)
+            ir = np.zeros(100)
+            ir[0] = 1.0
+            return pedalboard.Convolution(ir, mix=p["Mix"].current_value)
+            
+        return None
+
+    def _process_band(self, audio: np.ndarray, band_dna: Band) -> np.ndarray:
+        """Process a single band's audio through its module chain and gain."""
+        current_audio = audio
+        for module in band_dna.modules:
+            # Try to use mapped pedalboard plugin first for efficiency (if we were using a board)
+            # But currently we call module.process which might have custom logic (e.g. Saturation mix)
+            current_audio = module.process(current_audio, self.sample_rate)
+        
+        # Apply Band Gain
+        linear_gain = 10 ** (band_dna.gain.current_value / 20.0)
+        return current_audio * linear_gain
+
     def process(self, input_audio: np.ndarray, mix_dna: Mix) -> np.ndarray:
         """Processes the input audio using the provided Mix DNA."""
-        # 1. Split audio into bands using the Mix's crossovers
+        # 1. Process through PRE band
+        current_audio = self._process_band(input_audio, mix_dna.pre_band)
+
+        # 2. Split audio into bands using the Mix's crossovers
         crossover = Crossover(mix_dna.crossovers, self.sample_rate)
-        bands_audio = crossover.split(input_audio)
+        bands_audio = crossover.split(current_audio)
+        
+        # 3. Check for Solo state
+        solo_active = any(band.is_soloed for band in mix_dna.bands)
         
         processed_bands = []
         
-        # 2. Process each band with its corresponding module chain
+        # 4. Process each band with its corresponding module chain
         for i, band_dna in enumerate(mix_dna.bands):
             band_audio = bands_audio[i]
             
-            # Process band audio through each module's process() method
-            current_audio = band_audio
-            for module in band_dna.modules:
-                current_audio = module.process(current_audio, self.sample_rate)
-            
-            processed_bands.append(current_audio)
+            # Solo/Mute logic (applied only to parallel frequency bands)
+            if solo_active:
+                if not band_dna.is_soloed:
+                    processed_bands.append(np.zeros_like(band_audio))
+                    continue
+            elif band_dna.is_muted:
+                processed_bands.append(np.zeros_like(band_audio))
+                continue
+
+            processed_bands.append(self._process_band(band_audio, band_dna))
                 
-        # 3. Sum the processed bands back together
+        # 5. Sum the processed bands back together
         summed_audio = crossover.sum_bands(processed_bands)
         
-        # 4. Final Limiter to prevent clipping
+        # 6. Process through POST band
+        final_audio = self._process_band(summed_audio, mix_dna.post_band)
+        
+        # 7. Final Limiter to prevent clipping (safety)
         if pedalboard:
             limiter = pedalboard.Limiter(threshold_db=-0.1)
-            return limiter.process(summed_audio, self.sample_rate)
+            return limiter.process(final_audio, self.sample_rate)
         
-        return summed_audio
+        return final_audio
 
 
 if __name__ == "__main__":
