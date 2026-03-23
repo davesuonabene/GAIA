@@ -25,6 +25,30 @@ class Band:
         self.is_soloed = False
         self.gain = Parameter("Gain", 0.0, -24.0, 24.0, 10.0)
 
+    def to_dict(self) -> dict:
+        """Serialize band to a dictionary."""
+        return {
+            "name": self.name,
+            "is_muted": self.is_muted,
+            "is_soloed": self.is_soloed,
+            "gain": self.gain.to_dict(),
+            "modules": [m.to_dict() for m in self.modules]
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Reconstruct band from a dictionary."""
+        instance = cls(data["name"])
+        instance.is_muted = data.get("is_muted", False)
+        instance.is_soloed = data.get("is_soloed", False)
+        if "gain" in data:
+            instance.gain = Parameter.from_dict(data["gain"])
+        
+        instance.modules = []
+        for mod_data in data.get("modules", []):
+            instance.modules.append(AudioModule.from_dict(mod_data))
+        return instance
+
     def mutate_structure(self, mutation_rate: float) -> None:
         """
         Randomly add, remove, or swap modules in the chain based on mutation_rate (0.0 to 1.0).

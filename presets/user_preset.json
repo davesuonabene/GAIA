@@ -1,0 +1,930 @@
+{
+    "crossover_params": [
+        {
+            "name": "Crossover 1",
+            "current_value": 471.7689675644051,
+            "min_bound": 20.0,
+            "max_bound": 20000.0,
+            "drift_range": 10.0,
+            "is_locked": false
+        },
+        {
+            "name": "Crossover 2",
+            "current_value": 1658.4661308675477,
+            "min_bound": 20.0,
+            "max_bound": 20000.0,
+            "drift_range": 10.0,
+            "is_locked": false
+        },
+        {
+            "name": "Crossover 3",
+            "current_value": 2875.604378539278,
+            "min_bound": 20.0,
+            "max_bound": 20000.0,
+            "drift_range": 10.0,
+            "is_locked": false
+        },
+        {
+            "name": "Crossover 4",
+            "current_value": 5438.073480835465,
+            "min_bound": 20.0,
+            "max_bound": 20000.0,
+            "drift_range": 10.0,
+            "is_locked": false
+        }
+    ],
+    "pre_band": {
+        "name": "PRE",
+        "is_muted": false,
+        "is_soloed": false,
+        "gain": {
+            "name": "Gain",
+            "current_value": 0.6791853679489344,
+            "min_bound": -24.0,
+            "max_bound": 24.0,
+            "drift_range": 10.0,
+            "is_locked": false
+        },
+        "modules": [
+            {
+                "module_type": "CompressorModule",
+                "parameters": {
+                    "Threshold": {
+                        "name": "Threshold",
+                        "current_value": -4.142086227142398,
+                        "min_bound": -60.0,
+                        "max_bound": 0.0,
+                        "drift_range": 10.0,
+                        "is_locked": false
+                    },
+                    "Ratio": {
+                        "name": "Ratio",
+                        "current_value": 1.4553285731900703,
+                        "min_bound": 1.0,
+                        "max_bound": 20.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    },
+                    "Attack": {
+                        "name": "Attack",
+                        "current_value": 0.1,
+                        "min_bound": 0.1,
+                        "max_bound": 500.0,
+                        "drift_range": 10.0,
+                        "is_locked": false
+                    },
+                    "Release": {
+                        "name": "Release",
+                        "current_value": 1.0,
+                        "min_bound": 1.0,
+                        "max_bound": 2000.0,
+                        "drift_range": 10.0,
+                        "is_locked": false
+                    },
+                    "Gain": {
+                        "name": "Gain",
+                        "current_value": 0.2525210241459306,
+                        "min_bound": -12.0,
+                        "max_bound": 24.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    }
+                }
+            },
+            {
+                "module_type": "ConvolutionModule",
+                "parameters": {
+                    "Mix": {
+                        "name": "Mix",
+                        "current_value": 0.0,
+                        "min_bound": 0.0,
+                        "max_bound": 1.0,
+                        "drift_range": 0.1,
+                        "is_locked": false
+                    }
+                }
+            },
+            {
+                "module_type": "TransientShaperModule",
+                "parameters": {
+                    "Attack Boost": {
+                        "name": "Attack Boost",
+                        "current_value": 3.7299966322626026,
+                        "min_bound": -20.0,
+                        "max_bound": 20.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    },
+                    "Sustain Boost": {
+                        "name": "Sustain Boost",
+                        "current_value": -0.8296557259914557,
+                        "min_bound": -20.0,
+                        "max_bound": 20.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    }
+                }
+            }
+        ]
+    },
+    "bands": [
+        {
+            "name": "Band 1",
+            "is_muted": false,
+            "is_soloed": false,
+            "gain": {
+                "name": "Gain",
+                "current_value": 12.02993496259619,
+                "min_bound": -24.0,
+                "max_bound": 24.0,
+                "drift_range": 10.0,
+                "is_locked": false
+            },
+            "modules": [
+                {
+                    "module_type": "TransientShaperModule",
+                    "parameters": {
+                        "Attack Boost": {
+                            "name": "Attack Boost",
+                            "current_value": 1.4766925456485778,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Sustain Boost": {
+                            "name": "Sustain Boost",
+                            "current_value": 1.732019821029092,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "CompressorModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -6.731603940962179,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 2.0483292625665968,
+                            "min_bound": 1.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 137.6364807903948,
+                            "min_bound": 0.1,
+                            "max_bound": 500.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 156.78378447785266,
+                            "min_bound": 1.0,
+                            "max_bound": 2000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Gain": {
+                            "name": "Gain",
+                            "current_value": 3.2885259073518798,
+                            "min_bound": -12.0,
+                            "max_bound": 24.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ClipperModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -0.40655272768449335,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Softness": {
+                            "name": "Softness",
+                            "current_value": 0.0005669975967769044,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ExpanderModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -73.87185639444884,
+                            "min_bound": -80.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 1.2324921855252542,
+                            "min_bound": 1.0,
+                            "max_bound": 10.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 7.513657133016714,
+                            "min_bound": 0.1,
+                            "max_bound": 100.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 95.71776232506866,
+                            "min_bound": 10.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ConvolutionModule",
+                    "parameters": {
+                        "Mix": {
+                            "name": "Mix",
+                            "current_value": 0.0007858272354466372,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "LimiterModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": 0.0,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 24.25808105806412,
+                            "min_bound": 1.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Band 2",
+            "is_muted": false,
+            "is_soloed": false,
+            "gain": {
+                "name": "Gain",
+                "current_value": -7.19840314619171,
+                "min_bound": -24.0,
+                "max_bound": 24.0,
+                "drift_range": 10.0,
+                "is_locked": false
+            },
+            "modules": [
+                {
+                    "module_type": "TransientShaperModule",
+                    "parameters": {
+                        "Attack Boost": {
+                            "name": "Attack Boost",
+                            "current_value": -3.482152650206655,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Sustain Boost": {
+                            "name": "Sustain Boost",
+                            "current_value": 0.5633828464671837,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "SaturationModule",
+                    "parameters": {
+                        "Drive": {
+                            "name": "Drive",
+                            "current_value": 10.455684742291895,
+                            "min_bound": 0.0,
+                            "max_bound": 60.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Mix": {
+                            "name": "Mix",
+                            "current_value": 79.29127317767629,
+                            "min_bound": 0.0,
+                            "max_bound": 100.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ClipperModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -1.8433521922775626,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Softness": {
+                            "name": "Softness",
+                            "current_value": 0.00019533429622082578,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Band 3",
+            "is_muted": false,
+            "is_soloed": false,
+            "gain": {
+                "name": "Gain",
+                "current_value": 9.397163831806548,
+                "min_bound": -24.0,
+                "max_bound": 24.0,
+                "drift_range": 10.0,
+                "is_locked": false
+            },
+            "modules": [
+                {
+                    "module_type": "CompressorModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": 0.0,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 1.3122056988923565,
+                            "min_bound": 1.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 10.0,
+                            "min_bound": 0.1,
+                            "max_bound": 500.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 100.0,
+                            "min_bound": 1.0,
+                            "max_bound": 2000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Gain": {
+                            "name": "Gain",
+                            "current_value": 0.0,
+                            "min_bound": -12.0,
+                            "max_bound": 24.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "LimiterModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": 0.0,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 176.51680054689874,
+                            "min_bound": 1.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Band 4",
+            "is_muted": false,
+            "is_soloed": false,
+            "gain": {
+                "name": "Gain",
+                "current_value": -10.421733961803819,
+                "min_bound": -24.0,
+                "max_bound": 24.0,
+                "drift_range": 10.0,
+                "is_locked": false
+            },
+            "modules": [
+                {
+                    "module_type": "CompressorModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -1.2151726977102664,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 1.7624352537708585,
+                            "min_bound": 1.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 16.163812760821358,
+                            "min_bound": 0.1,
+                            "max_bound": 500.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 247.96711558693056,
+                            "min_bound": 1.0,
+                            "max_bound": 2000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Gain": {
+                            "name": "Gain",
+                            "current_value": -5.172110792046947,
+                            "min_bound": -12.0,
+                            "max_bound": 24.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ConvolutionModule",
+                    "parameters": {
+                        "Mix": {
+                            "name": "Mix",
+                            "current_value": 0.0,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "TransientShaperModule",
+                    "parameters": {
+                        "Attack Boost": {
+                            "name": "Attack Boost",
+                            "current_value": -4.803730290484234,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Sustain Boost": {
+                            "name": "Sustain Boost",
+                            "current_value": 1.6847640002360813,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "LimiterModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -2.2337087978170436,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 164.34378478367088,
+                            "min_bound": 1.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ClipperModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": 0.0,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Softness": {
+                            "name": "Softness",
+                            "current_value": 0.00011301798345876991,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "SaturationModule",
+                    "parameters": {
+                        "Drive": {
+                            "name": "Drive",
+                            "current_value": 0.0,
+                            "min_bound": 0.0,
+                            "max_bound": 60.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Mix": {
+                            "name": "Mix",
+                            "current_value": 100.0,
+                            "min_bound": 0.0,
+                            "max_bound": 100.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ExpanderModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -75.25812023398997,
+                            "min_bound": -80.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 1.4062771076442724,
+                            "min_bound": 1.0,
+                            "max_bound": 10.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 5.1712124793965994,
+                            "min_bound": 0.1,
+                            "max_bound": 100.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 114.90609602519979,
+                            "min_bound": 10.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Band 5",
+            "is_muted": false,
+            "is_soloed": false,
+            "gain": {
+                "name": "Gain",
+                "current_value": -9.83882589835593,
+                "min_bound": -24.0,
+                "max_bound": 24.0,
+                "drift_range": 10.0,
+                "is_locked": false
+            },
+            "modules": [
+                {
+                    "module_type": "CompressorModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -4.422659158976996,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 1.8825157878948668,
+                            "min_bound": 1.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 29.017084858556274,
+                            "min_bound": 0.1,
+                            "max_bound": 500.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 125.17588299192275,
+                            "min_bound": 1.0,
+                            "max_bound": 2000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Gain": {
+                            "name": "Gain",
+                            "current_value": 4.088559756368929,
+                            "min_bound": -12.0,
+                            "max_bound": 24.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ConvolutionModule",
+                    "parameters": {
+                        "Mix": {
+                            "name": "Mix",
+                            "current_value": 0.0,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ExpanderModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -80.0,
+                            "min_bound": -80.0,
+                            "max_bound": 0.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Ratio": {
+                            "name": "Ratio",
+                            "current_value": 1.1028000964712463,
+                            "min_bound": 1.0,
+                            "max_bound": 10.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Attack": {
+                            "name": "Attack",
+                            "current_value": 18.0147751615621,
+                            "min_bound": 0.1,
+                            "max_bound": 100.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 10.0,
+                            "min_bound": 10.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "LimiterModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -1.9604088536786366,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Release": {
+                            "name": "Release",
+                            "current_value": 174.42269813895737,
+                            "min_bound": 1.0,
+                            "max_bound": 1000.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "TransientShaperModule",
+                    "parameters": {
+                        "Attack Boost": {
+                            "name": "Attack Boost",
+                            "current_value": 1.7385340044231423,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Sustain Boost": {
+                            "name": "Sustain Boost",
+                            "current_value": 1.415846071440666,
+                            "min_bound": -20.0,
+                            "max_bound": 20.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "SaturationModule",
+                    "parameters": {
+                        "Drive": {
+                            "name": "Drive",
+                            "current_value": 0.0,
+                            "min_bound": 0.0,
+                            "max_bound": 60.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        },
+                        "Mix": {
+                            "name": "Mix",
+                            "current_value": 100.0,
+                            "min_bound": 0.0,
+                            "max_bound": 100.0,
+                            "drift_range": 10.0,
+                            "is_locked": false
+                        }
+                    }
+                },
+                {
+                    "module_type": "ClipperModule",
+                    "parameters": {
+                        "Threshold": {
+                            "name": "Threshold",
+                            "current_value": -0.23168860149242132,
+                            "min_bound": -60.0,
+                            "max_bound": 0.0,
+                            "drift_range": 5.0,
+                            "is_locked": false
+                        },
+                        "Softness": {
+                            "name": "Softness",
+                            "current_value": 0.0,
+                            "min_bound": 0.0,
+                            "max_bound": 1.0,
+                            "drift_range": 0.1,
+                            "is_locked": false
+                        }
+                    }
+                }
+            ]
+        }
+    ],
+    "post_band": {
+        "name": "POST",
+        "is_muted": false,
+        "is_soloed": false,
+        "gain": {
+            "name": "Gain",
+            "current_value": 3.4623009473182753,
+            "min_bound": -24.0,
+            "max_bound": 24.0,
+            "drift_range": 10.0,
+            "is_locked": false
+        },
+        "modules": [
+            {
+                "module_type": "TransientShaperModule",
+                "parameters": {
+                    "Attack Boost": {
+                        "name": "Attack Boost",
+                        "current_value": 1.9292507643982133,
+                        "min_bound": -20.0,
+                        "max_bound": 20.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    },
+                    "Sustain Boost": {
+                        "name": "Sustain Boost",
+                        "current_value": 1.2443351591870075,
+                        "min_bound": -20.0,
+                        "max_bound": 20.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    }
+                }
+            },
+            {
+                "module_type": "ClipperModule",
+                "parameters": {
+                    "Threshold": {
+                        "name": "Threshold",
+                        "current_value": -0.5972745009040077,
+                        "min_bound": -60.0,
+                        "max_bound": 0.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    },
+                    "Softness": {
+                        "name": "Softness",
+                        "current_value": 0.0004089696087237985,
+                        "min_bound": 0.0,
+                        "max_bound": 1.0,
+                        "drift_range": 0.1,
+                        "is_locked": false
+                    }
+                }
+            },
+            {
+                "module_type": "LimiterModule",
+                "parameters": {
+                    "Threshold": {
+                        "name": "Threshold",
+                        "current_value": 0.0,
+                        "min_bound": -60.0,
+                        "max_bound": 0.0,
+                        "drift_range": 5.0,
+                        "is_locked": false
+                    },
+                    "Release": {
+                        "name": "Release",
+                        "current_value": 1.7424387600376008,
+                        "min_bound": 1.0,
+                        "max_bound": 1000.0,
+                        "drift_range": 10.0,
+                        "is_locked": false
+                    }
+                }
+            }
+        ]
+    }
+}

@@ -21,6 +21,27 @@ class AudioModule:
         """Add a parameter to the module."""
         self.parameters[param.name] = param
 
+    def to_dict(self) -> dict:
+        """Serialize audio module to a dictionary."""
+        return {
+            "module_type": self.__class__.__name__,
+            "parameters": {name: p.to_dict() for name, p in self.parameters.items()}
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Reconstruct audio module from a dictionary."""
+        # Find the correct class in the module's globals if not specified
+        module_cls = cls
+        if "module_type" in data:
+            module_cls = globals().get(data["module_type"], cls)
+        
+        instance = module_cls()
+        for p_name, p_data in data.get("parameters", {}).items():
+            if p_name in instance.parameters:
+                instance.parameters[p_name] = Parameter.from_dict(p_data)
+        return instance
+
     def mutate_parameters(self, rate: float = 1.0) -> None:
         """Call mutate on all parameters in the module based on mutation rate."""
         for param in self.parameters.values():

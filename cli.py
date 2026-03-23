@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 # Ensure we can import from core and ga
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from core.metadata import TrackMetadata
+from core.preset_manager import PresetManager
 
 class FocusZone(Enum):
     MENU = auto()
@@ -52,6 +53,7 @@ from rich.progress import ProgressBar
 
 from core.mix import Mix
 from core.band import Band
+from core.parameter import Parameter
 from ga.population import Population
 from core.audio_module import (
     CompressorModule, ExpanderModule, TransientShaperModule, 
@@ -76,12 +78,14 @@ KEY_CTRL_C = "CTRL_C"
 KEY_ESC = "ESC"
 KEY_SPACE = " "
 KEY_BACKSPACE = "BACKSPACE"
+KEY_CTRL_BACKSPACE = "CTRL_BACKSPACE"
 KEY_L = "L"
 KEY_E = "E"
 KEY_P = "P"
 KEY_M = "M"
 KEY_S = "S"
 KEY_K = "K"
+KEY_D = "D"
 KEY_BRACKET_LEFT = "["
 KEY_BRACKET_RIGHT = "]"
 
@@ -134,7 +138,8 @@ def get_key(fd):
     if b in (b'\r', b'\n'): return KEY_ENTER
     if b == b'\t': return KEY_TAB
     if b == b'\x03': return KEY_CTRL_C
-    if b in (b'\x08', b'\x7f'): return KEY_BACKSPACE
+    if b == b'\x7f': return KEY_BACKSPACE
+    if b in (b'\x08', b'\x17'): return KEY_CTRL_BACKSPACE
     if b == b' ': return KEY_SPACE
     
     try:
@@ -144,6 +149,7 @@ def get_key(fd):
         if decoded == 'M': return KEY_M
         if decoded == 'S': return KEY_S
         if decoded == 'K': return KEY_K
+        if decoded == 'D': return KEY_D
         return decoded
     except Exception:
         return None
@@ -158,12 +164,14 @@ class GaiaTUI:
         # Navigation State
         self.focus_zone = FocusZone.POPULATION
         self.header_menu = HeaderMenu(items=[
-            MenuItem(title="File", action=lambda: None),
-            MenuItem(title="Analysis", action=lambda: None),
-            MenuItem(title="Settings", action=lambda: None),
+            MenuItem(title="File", children=[
+                MenuItem(title="Swap Input Track", action=self.action_swap_track),
+                MenuItem(title="Load Preset", action=self.action_load_preset_flow),
+                MenuItem(title="Save Preset", action=self.action_save_preset_flow),
+                MenuItem(title="Export Track", action=self.action_export_track_flow),
+            ]),
         ])
         self.metadata = TrackMetadata()
-        self.focus_row = 0 # 0: Population, 1: Bands
         self.selected_mix_idx = 0
         self.selected_file_idx = 0 # Separate index for file browser
         self.selected_band_idx = 0
@@ -174,6 +182,17 @@ class GaiaTUI:
         # FX Selection Mode
         self.selecting_new_fx = False
         self.available_fx_pool = []
+        
+        # Dynamic Input Mode
+        self.editing = False
+        self.edit_buffer = ""
+        self.input_mode = None # "SAVE_PRESET", "EXPORT_TRACK", or None
+        
+        # Sub-menu State
+        self.in_submenu = False
+        self.selected_child_idx = 0
+        
+        self.confirming_delete = False
         
         self.running = True
         self.engine = Engine(sample_rate=self.sample_rate) if self.sample_rate else None
@@ -202,8 +221,8 @@ class GaiaTUI:
         self.status_msg = "Arrows: Navigate/Adjust | TAB: Zone | CTRL+Arrows: Granular/Jump | SPACE: Play/Stop"
 
     def refresh_file_list(self):
-        """Scans path for audio files."""
-        exts = (".wav", ".flac", ".mp3", ".aiff", ".ogg")
+        """Scans path for audio and preset files."""
+        exts = (".wav", ".flac", ".mp3", ".aiff", ".ogg", ".json")
         try:
             items = os.listdir(self.current_path)
             self.file_list = [{"name": "..", "type": "dir"}] if os.path.dirname(self.current_path) != self.current_path else []
@@ -228,6 +247,41 @@ class GaiaTUI:
         if self.process_thread is None or not self.process_thread.is_alive():
             self.process_thread = threading.Thread(target=self.reprocess_audio_task, daemon=True)
             self.process_thread.start()
+
+    def action_export_track_flow(self):
+        """Initiate the export flow."""
+        if self.audio_data is None:
+            self.status_msg = "Nothing to export."
+            return
+        self.editing = True
+        self.input_mode = "EXPORT_TRACK"
+        self.edit_buffer = ""
+        self.status_msg = "Enter export filename (no ext): █ (ENTER to export, ESC to cancel)"
+
+    def action_swap_track(self):
+        """Reset state and go back to File Picker."""
+        if self.is_playing:
+            self.toggle_playback()
+        self.audio_data = None
+        self.engine = None
+        self.mode = "FILE_PICKER"
+        self.status_msg = "Pick a new audio track."
+        self.refresh_file_list()
+
+    def action_save_preset_flow(self):
+        """Initiate the save preset flow."""
+        self.editing = True
+        self.input_mode = "SAVE_PRESET"
+        self.edit_buffer = ""
+        self.status_msg = "Enter preset name: █ (ENTER to save, ESC to cancel)"
+
+    def action_load_preset_flow(self):
+        """Open the file picker in the presets directory."""
+        os.makedirs("./presets", exist_ok=True)
+        self.mode = "FILE_PICKER"
+        self.current_path = os.path.abspath("./presets")
+        self.refresh_file_list()
+        self.status_msg = "Arrows: Select Preset | ENTER: Load | ESC: Cancel"
 
     def audio_callback(self, outdata, frames, time_info, status):
         if self.processed_audio is None:
@@ -347,7 +401,6 @@ class GaiaTUI:
                     continue
                 
                 # Resilience: handle Crossover parameters
-                from core.parameter import Parameter
                 if isinstance(item, Parameter):
                     # For crossovers, we just show the name and value
                     val_txt = self.edit_buffer if (is_mod_sel and self.editing) else f"{item.current_value:.0f}Hz"
@@ -477,6 +530,26 @@ class GaiaTUI:
 
     def execute_action(self):
         """Executes the primary action (ENTER) based on the current focus."""
+        if self.confirming_delete:
+            cols = self.get_column_data(1)
+            band = cols[self.selected_band_idx]
+            if isinstance(band, Band):
+                try:
+                    # The modules_list used for selection might include [+] buttons
+                    # but band.modules is pure AudioModules.
+                    # We need to make sure we pop the correct one.
+                    # Depth 2 data: Band modules + [+] button. 
+                    # selected_module_idx should match band.modules if it's an AudioModule.
+                    removed = band.modules.pop(self.selected_module_idx)
+                    self.status_msg = f"Deleted {removed.name}."
+                    self.selected_module_idx = max(0, self.selected_module_idx - 1)
+                    self.selected_param_idx = 0
+                    if self.is_playing: self.request_reprocessing()
+                except Exception as e:
+                    self.status_msg = f"Delete Error: {e}"
+            self.confirming_delete = False
+            return
+
         if self.mode == "FILE_PICKER":
             if self.file_list:
                 item = self.file_list[self.selected_file_idx]
@@ -484,13 +557,46 @@ class GaiaTUI:
                     self.current_path = os.path.abspath(os.path.join(self.current_path, item["name"]))
                     self.refresh_file_list()
                 else:
-                    self.load_audio(item["name"])
+                    if item["name"].endswith(".json"):
+                        try:
+                            filepath = os.path.join(self.current_path, item["name"])
+                            loaded_mix = PresetManager.load_preset(filepath)
+                            mix_idx = self.selected_mix_idx % len(self.population.mixes)
+                            self.population.mixes[mix_idx] = loaded_mix
+                            self.selected_module_idx = 0
+                            self.selected_param_idx = 0
+                            self.mode = "EVOLUTION"
+                            self.status_msg = f"Loaded preset: {item['name']}"
+                            if self.is_playing: self.request_reprocessing()
+                        except Exception as e:
+                            self.status_msg = f"Load Failed: {e}"
+                    else:
+                        self.load_audio(item["name"])
             return
 
         if self.focus_zone == FocusZone.MENU:
             item = self.header_menu.items[self.header_menu.selected_index]
-            if item.action:
-                item.action()
+            
+            if self.in_submenu:
+                # Execute the selected child action
+                if 0 <= self.selected_child_idx < len(item.children):
+                    child = item.children[self.selected_child_idx]
+                    if child.action:
+                        child.action()
+                        self.in_submenu = False
+                        # Note: Most actions (Swap, Load) change mode/zone themselves, 
+                        # but we fallback to BANDS for consistency if they don't.
+                        if self.mode == "EVOLUTION":
+                            self.focus_zone = FocusZone.BANDS
+            else:
+                # Enter sub-menu or execute parent action
+                if item.action:
+                    item.action()
+                    self.focus_zone = FocusZone.BANDS
+                elif item.children:
+                    self.in_submenu = True
+                    self.selected_child_idx = 0
+                    self.status_msg = f"Navigating {item.title}... (Arrows: Select, ENTER: Execute, ESC: Back)"
             return
 
         if self.focus_zone == FocusZone.POPULATION:
@@ -557,13 +663,49 @@ class GaiaTUI:
                 self.edit_buffer = str(round(p.current_value, 2))
 
     def navigate(self, key: str):
+        if self.confirming_delete:
+            if key == KEY_ENTER:
+                self.execute_action()
+                return
+            elif key == KEY_ESC:
+                self.confirming_delete = False
+                self.status_msg = "Deletion cancelled."
+                return
+            else:
+                return # Block other inputs during confirmation
+
         if self.editing:
             if key == KEY_ENTER:
-                try: self.set_value(float(self.edit_buffer))
-                except: pass
-                self.editing = False; self.edit_buffer = ""
+                if self.input_mode == "SAVE_PRESET":
+                    try:
+                        mix_idx = self.selected_mix_idx % len(self.population.mixes)
+                        mix = self.population.mixes[mix_idx]
+                        os.makedirs("./presets", exist_ok=True)
+                        filepath = f"./presets/{self.edit_buffer}.json"
+                        PresetManager.save_preset(mix, filepath)
+                        self.status_msg = f"Saved preset to {filepath}"
+                    except Exception as e:
+                        self.status_msg = f"Save Failed: {e}"
+                elif self.input_mode == "EXPORT_TRACK":
+                    try:
+                        self.status_msg = "Exporting..."
+                        mix_idx = self.selected_mix_idx % len(self.population.mixes)
+                        mix = self.population.mixes[mix_idx]
+                        exported_audio = self.engine.process(self.audio_data, mix)
+                        exported_audio = np.clip(exported_audio, -1.0, 1.0)
+                        filename = f"{self.edit_buffer}.wav"
+                        output_path = os.path.join(self.output_dir, filename)
+                        sf.write(output_path, exported_audio.T, self.sample_rate)
+                        self.status_msg = f"Exported to {filename}"
+                    except Exception as e:
+                        self.status_msg = f"Export Failed: {e}"
+                else:
+                    try: self.set_value(float(self.edit_buffer))
+                    except: pass
+                self.editing = False; self.edit_buffer = ""; self.input_mode = None
             elif key == KEY_ESC:
-                self.editing = False; self.edit_buffer = ""
+                self.editing = False; self.edit_buffer = ""; self.input_mode = None
+                self.status_msg = "Cancelled."
             elif key == KEY_BACKSPACE:
                 self.edit_buffer = self.edit_buffer[:-1]
             elif key and len(key) == 1 and key != " ":
@@ -584,6 +726,7 @@ class GaiaTUI:
             idx = zones.index(self.focus_zone)
             self.focus_zone = zones[(idx + 1) % len(zones)]
             self.selecting_new_fx = False # Exit selection mode when switching zones
+            self.confirming_delete = False
             return
 
         if key == KEY_SPACE:
@@ -593,6 +736,17 @@ class GaiaTUI:
         if key == KEY_ENTER:
             self.execute_action()
             return
+
+        # Delete FX Logic
+        if key == KEY_D and self.focus_zone == FocusZone.BANDS and not self.editing:
+            modules_list = self.get_column_data(2)
+            if 0 <= self.selected_module_idx < len(modules_list):
+                item = modules_list[self.selected_module_idx]
+                if not isinstance(item, str) and not isinstance(item, Parameter):
+                    # It's an AudioModule
+                    self.confirming_delete = True
+                    self.status_msg = f"Delete {item.name}? (ENTER: Yes, ESC: No)"
+                    return
 
         # Mix Sorting logic (Depth 0 = FocusZone.POPULATION)
         if self.focus_zone == FocusZone.POPULATION:
@@ -618,6 +772,10 @@ class GaiaTUI:
             elif key == KEY_BACKSPACE:
                 self.current_path = os.path.abspath(os.path.join(self.current_path, ".."))
                 self.refresh_file_list()
+            elif key == KEY_ESC:
+                if self.audio_data is not None:
+                    self.mode = "EVOLUTION"
+                    self.status_msg = "Evolution Mode."
             return
 
         # Evolution Global Shortcuts
@@ -664,6 +822,20 @@ class GaiaTUI:
 
     def _handle_menu_input(self, key: str):
         if not self.header_menu.items: return
+        
+        item = self.header_menu.items[self.header_menu.selected_index]
+        
+        if self.in_submenu:
+            if key == KEY_LEFT:
+                self.selected_child_idx = (self.selected_child_idx - 1) % len(item.children)
+            elif key == KEY_RIGHT:
+                self.selected_child_idx = (self.selected_child_idx + 1) % len(item.children)
+            elif key == KEY_UP: # Allow vertical navigation to exit sub-menu
+                self.in_submenu = False
+            elif key == KEY_ESC:
+                self.in_submenu = False
+            return
+
         if key == KEY_LEFT:
             self.header_menu.selected_index = (self.header_menu.selected_index - 1) % len(self.header_menu.items)
         elif key == KEY_RIGHT:
@@ -801,8 +973,16 @@ class GaiaTUI:
         # Common Header and Status
         menu_texts = []
         for i, item in enumerate(self.header_menu.items):
-            style = "bold white on blue" if (self.focus_zone == FocusZone.MENU and i == self.header_menu.selected_index) else "white"
+            is_parent_selected = (self.focus_zone == FocusZone.MENU and i == self.header_menu.selected_index)
+            style = "bold white on blue" if is_parent_selected else "white"
             menu_texts.append(Text(f" [{item.title}] ", style=style))
+            
+            # If this is the active sub-menu, render children
+            if is_parent_selected and self.in_submenu:
+                for j, child in enumerate(item.children):
+                    is_child_sel = (j == self.selected_child_idx)
+                    child_style = "bold black on yellow" if is_child_sel else "cyan"
+                    menu_texts.append(Text(f" {child.title} ", style=child_style))
             
         header_left = Text(f" GAIA | {self.metadata.filename or '---'}", style="bold magenta")
         header_gen = Text(f"Gen {self.population.generation_count}", style="bold cyan")

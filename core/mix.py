@@ -36,6 +36,35 @@ class Mix:
             name = band_names[i] if i < len(band_names) else f"Band {i+1}"
             self.bands.append(Band(name))
 
+    def to_dict(self) -> dict:
+        """Serialize mix to a dictionary."""
+        return {
+            "crossover_params": [p.to_dict() for p in self.crossover_params],
+            "pre_band": self.pre_band.to_dict(),
+            "bands": [b.to_dict() for b in self.bands],
+            "post_band": self.post_band.to_dict()
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Reconstruct mix from a dictionary."""
+        # Create a basic Mix instance with dummy crossovers
+        instance = cls(crossovers=[])
+        
+        if "crossover_params" in data:
+            instance.crossover_params = [Parameter.from_dict(p) for p in data["crossover_params"]]
+        
+        if "pre_band" in data:
+            instance.pre_band = Band.from_dict(data["pre_band"])
+        
+        if "bands" in data:
+            instance.bands = [Band.from_dict(b) for b in data["bands"]]
+            
+        if "post_band" in data:
+            instance.post_band = Band.from_dict(data["post_band"])
+            
+        return instance
+
     @property
     def crossover_frequencies(self) -> List[float]:
         """Returns a sorted list of current crossover frequency values."""

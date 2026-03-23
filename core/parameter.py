@@ -25,6 +25,22 @@ class Parameter:
         # Respect bounds
         self.current_value = max(self.min_bound, min(self.max_bound, new_value))
 
+    def to_dict(self) -> dict:
+        """Serialize parameter to a dictionary."""
+        return {
+            "name": self.name,
+            "current_value": self.current_value,
+            "min_bound": self.min_bound,
+            "max_bound": self.max_bound,
+            "drift_range": self.drift_range,
+            "is_locked": self.is_locked
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Reconstruct parameter from a dictionary."""
+        return cls(**data)
+
     def __repr__(self) -> str:
         status = "[LOCKED]" if self.is_locked else ""
         return f"{self.name}: {self.current_value:7.2f} {status}"
