@@ -35,6 +35,8 @@ gaia/
 ├── audio/                 # Audio Engine (DSP & Analysis)
 │   ├── analyzer.py        # Feature extraction (RMS, Transients, etc.)
 │   ├── engine.py          # Routing and DSP execution
+│   └── crossover.py       # Band-splitting stateful filter logic
+├── STEM-CACHE/            # Persistent storage for separated stems
 ...
 ```
 
@@ -43,46 +45,42 @@ gaia/
 The interface uses a high-density, responsive layout designed for professional audio workflows.
 
 ### UI Features
-*   **Contextual Header**: Displays the current file name and evolutionary generation at a glance.
+*   **Contextual Header**: Displays the current file name and evolutionary generation.
+*   **Stems Menu**: Dedicated menu for triggered high-fidelity source separation.
 *   **Miller Column Bands**: Each frequency band is rendered as a discrete panel.
     *   **Frequency Title**: The crossover frequency is pinned to the **top-right** of each band.
     *   **Mixing Subtitle**: Band-level Gain is centered at the **bottom** of the panel.
-    *   **Pro Layout**: DSP module names are **UPPERCASE** and **left-justified**, while parameters are **right-justified** for maximum visual separation. No truncation is applied if space permits.
-*   **Focus Highlighting**: Active zones (Menu, Population, Bands, Playback) are visually distinguished by border colors and brightness. The Population panel is now a clean box without redundant tags.
+*   **Pre-Mix Stems Row**: Dedicated panel for adjusting source balance before DSP.
+*   **Focus Highlighting**: Active zones (Menu, Population, Stems, Bands, Playback) are visually distinguished by color.
 
 ### Navigation Controls
-*   **SHIFT + Up / Down**: In the **Population** zone, swap the position of the selected mix with the one above or below it.
-*   **TAB**: Cycle focus globally between the `MENU`, `POPULATION`, `BANDS`, and `PLAYBACK` zones.
+*   **TAB**: Cycle focus globally between the `MENU`, `POPULATION`, `STEMS`, `BANDS`, and `PLAYBACK` zones.
 *   **Arrows (↑ / ↓ / ← / →)**: Navigate contextually *within* the currently focused zone.
-*   **CTRL + Arrows**: Rapid navigation and comparison.
-    *   *In Bands (Up/Down)*: Jump directly to the previous/next Module (Gene Group) or Band Gain.
-    *   *In Bands (Left/Right)*: Switch between different frequency bands to compare parameters instantly.
-    *   *Granular Adjustments*: When adjusting a numeric value, holding CTRL provides 5x more precision.
-    *   *In Playback (Left/Right)*: Granular audio scrub (1 second instead of 5).
-*   **K**: Toggle **Lock** status for the currently selected parameter (prevents mutation).
-*   **M / S**: Toggle **Mute** or **Solo** for the currently selected band.
+*   **CTRL + Arrows**: Rapid navigation and 5x granular precision for value adjustments.
+*   **K**: Toggle **Lock** status for the currently selected parameter.
+*   **M / S**: 
+    *   In **Bands Row**: Toggle **Mute** or **Solo** for the selected frequency band.
+    *   In **Stems Row**: Toggle **Mute** or **Solo** for the selected source stem (Vocals, Drums, Bass, Other).
 *   **Brackets ([ / ])**: Quick-switch between frequency Bands globally.
 *   **SPACE / P**: Toggle **Playback** 🔊 of the current mix.
 *   **ENTER**: 
     *   In **Population Row**: Evolve a new generation from the selected parent.
-    *   In **Bands Row**: 
-        *   If `[+] Add FX` is selected: Manually add the first available missing module to the band.
-        *   Otherwise: Enter **Inline Edit** mode for the selected parameter.
-*   **L**: Return to **File Browser** to load a different audio file.
+    *   In **Bands Row**: Enter **Inline Edit** mode or add missing effects.
+*   **L**: Return to **File Browser**.
 *   **E**: **Export** the current mix to a WAV file.
-*   **ESC**: Cancel inline editing.
-*   **CTRL+C**: Exit the application.
 
-### Key Features
-*   **Audio Engine**: Powered by `pedalboard` and `sounddevice`. Supports real-time Mute/Solo/Gain routing.
-*   **Saturation Module**: DSP module with `Drive` and `Mix` controls for harmonic enrichment.
-*   **Real-time Streaming**: Audio is processed continuously in a background thread, preventing UI lockups.
-*   **Safe-Spawning**: New modules are initialized with transparent settings to prevent audio surprises.
+## 🧬 Stem Separation & Caching
+
+GAIA features integrated source separation powered by the **Demucs (HTDemucs)** model.
+
+*   **Background Processing**: Stem separation runs in a dedicated thread with a real-time progress bar in the TUI.
+*   **STEM-CACHE**: Separated stems are saved permanently in the `STEM-CACHE/` directory.
+*   **Auto-Load**: GAIA automatically detects if a file has been separated before and loads cached stems instantly upon track selection.
+*   **Pre-Mixer**: Adjust the volume, mute, or solo source stems (Vocals, Drums, Bass, Other) before they enter the evolutionary effects chain.
 
 ## 🔬 Analysis Engine
 The `audio/analyzer.py` system calculates feature data for evolutionary fitness.
-*   **Configurable Pipeline**: A dataclass `AnalysisConfig` controls which features (RMS, transients, spectral centroid, BPM, MFCC) are extracted.
-*   **Track Metadata**: The `core/metadata.py` module manages basic file info to be fed into the analyzer.
+*   **Configurable Pipeline**: Extracts RMS, transients, spectral centroid, BPM, and MFCC coefficients.
 
 ## 🚀 Getting Started
 
@@ -90,6 +88,7 @@ The `audio/analyzer.py` system calculates feature data for evolutionary fitness.
     ```bash
     cd .openclaw/workspace/projects/gaia
     source venv/bin/activate
+    # Ensure demucs and torch dependencies are installed
     ```
 
 2.  **Launch the System**:
