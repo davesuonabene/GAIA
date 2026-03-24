@@ -186,14 +186,16 @@ class GaiaTUI:
         self.selected_param_idx = 0
         self.editing_crossover = False
         
+        # Stem Navigation Cursors
+        self.stem_col_idx = 0
+        self.stem_mod_idx = 0
+        self.stem_param_idx = 0
+        
         # Stem Separation State
         self.is_separating = False
         self.separation_progress = 0.0
         self.stems_data = None
-        self.stem_gains = {"vocals": 0.0, "drums": 0.0, "bass": 0.0, "other": 0.0}
-        self.stem_mutes = {"vocals": False, "drums": False, "bass": False, "other": False}
-        self.stem_solos = {"vocals": False, "drums": False, "bass": False, "other": False}
-        self.selected_stem_idx = 0
+        self.selected_stem_idx = 0 # DEPRECATED, will be replaced by stem_col_idx but keeping for safety if used elsewhere
         self.stem_names = ["vocals", "drums", "bass", "other"]
         
         # FX Selection Mode
@@ -311,10 +313,6 @@ class GaiaTUI:
             self.is_separating = False
             self.separation_progress = 0.0
 
-    def _get_linear_gain(self, stem_name: str) -> float:
-        db_gain = self.stem_gains.get(stem_name, 0.0)
-        return 10 ** (db_gain / 20.0)
-
     def audio_callback(self, outdata, frames, time_info, status):
         if self.audio_data is None:
             outdata.fill(0)
@@ -325,25 +323,14 @@ class GaiaTUI:
         if self.stems_data is not None:
             source_len = min([s.shape[1] for s in self.stems_data.values()])
 
-        # Helper to fetch and mix a chunk
+        # Helper to fetch and slice a chunk
         def fetch_chunk(start_idx, count):
             if self.stems_data is None:
                 return self.audio_data[:, start_idx:start_idx+count]
             else:
-                num_channels = self.stems_data["vocals"].shape[0]
-                chunk_sum = np.zeros((num_channels, count))
-                any_solo = any(self.stem_solos.values())
-                
-                for name, stem_audio in self.stems_data.items():
-                    if any_solo and not self.stem_solos[name]: continue
-                    if self.stem_mutes[name] and not self.stem_solos[name]: continue
-                    
-                    gain = self._get_linear_gain(name)
-                    chunk_sum += stem_audio[:, start_idx:start_idx+count] * gain
-                
-                if self.audio_data.shape[0] == 1 and num_channels > 1:
-                    chunk_sum = np.mean(chunk_sum, axis=0, keepdims=True)
-                return chunk_sum
+                # Return a dictionary of chunks for the engine to handle
+                return {name: stem_audio[:, start_idx:start_idx+count] 
+                        for name, stem_audio in self.stems_data.items()}
 
         # 2. Slice current chunk with loop handling
         try:
@@ -355,23 +342,56 @@ class GaiaTUI:
                 n1 = max(0, source_len - self.play_idx)
                 n2 = frames - n1
                 
-                raw_chunk = np.zeros((self.audio_data.shape[0], frames))
-                if n1 > 0:
-                    raw_chunk[:, :n1] = fetch_chunk(self.play_idx, n1)
-                
-                # Wrap to beginning
-                self.play_idx = 0
-                if n2 > 0:
-                    fill_size = min(n2, source_len)
-                    raw_chunk[:, n1:n1+fill_size] = fetch_chunk(0, fill_size)
-                    self.play_idx = fill_size
+                if self.stems_data is None:
+                    raw_chunk = np.zeros((self.audio_data.shape[0], frames))
+                    if n1 > 0:
+                        raw_chunk[:, :n1] = fetch_chunk(self.play_idx, n1)
+                    
+                    self.play_idx = 0
+                    if n2 > 0:
+                        fill_size = min(n2, source_len)
+                        raw_chunk[:, n1:n1+fill_size] = fetch_chunk(0, fill_size)
+                        self.play_idx = fill_size
+                else:
+                    # Wrap around for stems
+                    raw_chunk = {}
+                    num_channels = next(iter(self.stems_data.values())).shape[0]
+                    for name in self.stems_data:
+                        stem_raw = np.zeros((num_channels, frames))
+                        if n1 > 0:
+                            stem_raw[:, :n1] = self.stems_data[name][:, self.play_idx:self.play_idx+n1]
+                        
+                        if n2 > 0:
+                            fill_size = min(n2, source_len)
+                            stem_raw[:, n1:n1+fill_size] = self.stems_data[name][:, 0:fill_size]
+                        
+                        raw_chunk[name] = stem_raw
+                    
+                    self.play_idx = n2 % source_len if n2 > 0 else 0
 
             # 3. Process chunk through active DSP state
-            # Ensure C-contiguity for SciPy/Pedalboard
-            raw_chunk = np.ascontiguousarray(raw_chunk)
+            if isinstance(raw_chunk, dict):
+                # Ensure C-contiguity for each stem
+                raw_chunk = {k: np.ascontiguousarray(v) for k, v in raw_chunk.items()}
+            else:
+                raw_chunk = np.ascontiguousarray(raw_chunk)
+                
             processed_chunk = self.engine.process_chunk(raw_chunk)
             
-            # 4. Assign to output
+            # 4. Handle channel mismatch (e.g., stereo stems on mono output)
+            if processed_chunk.shape[0] != outdata.shape[1]:
+                if outdata.shape[1] == 1:
+                    processed_chunk = np.mean(processed_chunk, axis=0, keepdims=True)
+                elif processed_chunk.shape[0] == 1:
+                    processed_chunk = np.tile(processed_chunk, (outdata.shape[1], 1))
+                else:
+                    # Truncate or pad if they are both multi-channel but different
+                    new_chunk = np.zeros((outdata.shape[1], processed_chunk.shape[1]))
+                    min_ch = min(outdata.shape[1], processed_chunk.shape[0])
+                    new_chunk[:min_ch, :] = processed_chunk[:min_ch, :]
+                    processed_chunk = new_chunk
+
+            # 5. Assign to output
             outdata[:] = processed_chunk.T
         except Exception:
             outdata.fill(0)
@@ -454,6 +474,18 @@ class GaiaTUI:
         idx = self.selected_mix_idx % len(self.population.mixes)
         mix = self.population.mixes[idx]
         
+        if self.focus_zone == FocusZone.STEMS:
+            if depth == 1:
+                return [mix.stem_bands[name] for name in self.stem_names]
+            if depth == 2:
+                if self.selecting_new_fx:
+                    return self.available_fx_pool
+                col_data = self.get_column_data(1)
+                if 0 <= self.stem_col_idx < len(col_data):
+                    parent = col_data[self.stem_col_idx]
+                    return parent.modules + ["[+] Add FX"]
+            return []
+
         if depth == 1:
             # Tree conceptually: [pre_band, ...bands, post_band]
             return [mix.pre_band] + mix.bands + [mix.post_band]
@@ -481,8 +513,12 @@ class GaiaTUI:
                 items.append(Text(" SELECT FX TO ADD: ", style="bold white on green"))
                 items.append(Text("-" * 20, style="dim"))
 
+            # Determine which cursors to use
+            cur_mod_idx = self.stem_mod_idx if self.focus_zone == FocusZone.STEMS else self.selected_module_idx
+            cur_param_idx = self.stem_param_idx if self.focus_zone == FocusZone.STEMS else self.selected_param_idx
+
             for m_idx, item in enumerate(column_data):
-                is_mod_sel = is_focused and (not self.editing_crossover) and self.selected_module_idx == m_idx
+                is_mod_sel = is_focused and (not self.editing_crossover) and cur_mod_idx == m_idx
                 
                 # Handling Class types (for selection mode)
                 if isinstance(item, type):
@@ -511,13 +547,14 @@ class GaiaTUI:
                 style = "bold white on blue" if is_mod_sel else "white"
                 items.append(Text(f"[{mod_name}]", style=style, no_wrap=True))
                 
-                # Render parameters
-                for p_idx, (p_name, p) in enumerate(item.parameters.items()):
-                    is_p_sel = is_mod_sel and self.selected_param_idx == p_idx
-                    val_txt = self.edit_buffer if (is_p_sel and self.editing) else f"{p.current_value:.1f}"
-                    if p.is_locked: val_txt = f"*{val_txt}"
-                    p_style = "bold black on yellow" if (is_p_sel and self.editing) else "bold white on cyan" if is_p_sel else "dim"
-                    items.append(Align.right(Text(f" {p_name}: {val_txt}", style=p_style, overflow="ellipsis", no_wrap=True)))
+                # Render parameters ONLY if selected (Accordion Logic)
+                if is_mod_sel:
+                    for p_idx, (p_name, p) in enumerate(item.parameters.items()):
+                        is_p_sel = is_mod_sel and cur_param_idx == p_idx
+                        val_txt = self.edit_buffer if (is_p_sel and self.editing) else f"{p.current_value:.1f}"
+                        if p.is_locked: val_txt = f"*{val_txt}"
+                        p_style = "bold black on yellow" if (is_p_sel and self.editing) else "bold white on cyan" if is_p_sel else "dim"
+                        items.append(Align.right(Text(f" {p_name}: {val_txt}", style=p_style, overflow="ellipsis", no_wrap=True)))
         
         return Group(*items)
 
@@ -526,6 +563,25 @@ class GaiaTUI:
         idx = self.selected_mix_idx % len(self.population.mixes)
         mix = self.population.mixes[idx]
         
+        if self.focus_zone == FocusZone.STEMS:
+            cols = self.get_column_data(1)
+            if self.stem_col_idx >= len(cols): return None
+            parent = cols[self.stem_col_idx]
+            
+            modules_list = self.get_column_data(2)
+            self.stem_mod_idx = max(-1, min(self.stem_mod_idx, len(modules_list) - 1))
+            
+            if self.stem_mod_idx == -1 and isinstance(parent, Band):
+                return parent.gain
+            
+            if 0 <= self.stem_mod_idx < len(modules_list):
+                item = modules_list[self.stem_mod_idx]
+                if hasattr(item, "parameters"):
+                    params = list(item.parameters.values())
+                    self.stem_param_idx = max(0, min(self.stem_param_idx, max(0, len(params) - 1)))
+                    return params[self.stem_param_idx] if len(params) > 0 else None
+            return None
+
         # New logic using get_column_data (Depth 1)
         cols = self.get_column_data(1)
         if self.selected_band_idx >= len(cols): return None
@@ -635,27 +691,32 @@ class GaiaTUI:
         """Executes the primary action (ENTER) based on the current focus."""
         if self.confirming_delete:
             cols = self.get_column_data(1)
-            band = cols[self.selected_band_idx]
-            if isinstance(band, Band):
-                try:
-                    # The modules_list used for selection might include [+] buttons
-                    # but band.modules is pure AudioModules.
-                    # We need to make sure we pop the correct one.
-                    # Depth 2 data: Band modules + [+] button. 
-                    # selected_module_idx should match band.modules if it's an AudioModule.
-                    removed = band.modules.pop(self.selected_module_idx)
-                    self.status_msg = f"Deleted {removed.name}."
-                    self.selected_module_idx = max(0, self.selected_module_idx - 1)
-                    self.selected_param_idx = 0
-                    if self.is_playing:
-                        idx = self.selected_mix_idx % len(self.population.mixes)
-                        self.engine.update_mix(self.population.mixes[idx])
-                except Exception as e:
-                    self.status_msg = f"Delete Error: {e}"
+            # Use correct cursors based on zone
+            cur_col_idx = self.stem_col_idx if self.focus_zone == FocusZone.STEMS else self.selected_band_idx
+            cur_mod_idx = self.stem_mod_idx if self.focus_zone == FocusZone.STEMS else self.selected_module_idx
+            
+            if cur_col_idx < len(cols):
+                band = cols[cur_col_idx]
+                if isinstance(band, Band):
+                    try:
+                        removed = band.modules.pop(cur_mod_idx)
+                        self.status_msg = f"Deleted {removed.name}."
+                        if self.focus_zone == FocusZone.STEMS:
+                            self.stem_mod_idx = max(0, self.stem_mod_idx - 1)
+                            self.stem_param_idx = 0
+                        else:
+                            self.selected_module_idx = max(0, self.selected_module_idx - 1)
+                            self.selected_param_idx = 0
+                        if self.is_playing:
+                            idx = self.selected_mix_idx % len(self.population.mixes)
+                            self.engine.update_mix(self.population.mixes[idx])
+                    except Exception as e:
+                        self.status_msg = f"Delete Error: {e}"
             self.confirming_delete = False
             return
 
         if self.mode == "FILE_PICKER":
+            # ... existing file picker logic ...
             if self.file_list:
                 item = self.file_list[self.selected_file_idx]
                 if item["type"] == "dir":
@@ -681,6 +742,7 @@ class GaiaTUI:
             return
 
         if self.focus_zone == FocusZone.MENU:
+            # ... existing menu logic ...
             item = self.header_menu.items[self.header_menu.selected_index]
             
             if self.in_submenu:
@@ -713,15 +775,18 @@ class GaiaTUI:
                 self.engine.update_mix(self.population.mixes[idx])
             return
 
-        if self.focus_zone == FocusZone.BANDS:
+        if self.focus_zone in (FocusZone.BANDS, FocusZone.STEMS):
+            # Use correct cursors
+            cur_col_idx = self.stem_col_idx if self.focus_zone == FocusZone.STEMS else self.selected_band_idx
+            cur_mod_idx = self.stem_mod_idx if self.focus_zone == FocusZone.STEMS else self.selected_module_idx
+
             # Handle confirming FX selection
             if self.selecting_new_fx:
-                idx = self.selected_module_idx
-                if 0 <= idx < len(self.available_fx_pool):
+                if 0 <= cur_mod_idx < len(self.available_fx_pool):
                     cols = self.get_column_data(1)
-                    band = cols[self.selected_band_idx]
+                    band = cols[cur_col_idx]
                     if isinstance(band, Band):
-                        selected_cls = self.available_fx_pool[idx]
+                        selected_cls = self.available_fx_pool[cur_mod_idx]
                         new_mod = selected_cls()
                         band.modules.append(new_mod)
                         self.status_msg = f"Added {new_mod.name} to {band.name}"
@@ -730,10 +795,13 @@ class GaiaTUI:
                             self.engine.update_mix(self.population.mixes[idx])
                 
                 self.selecting_new_fx = False
-                self.selected_module_idx = 0
+                if self.focus_zone == FocusZone.STEMS:
+                    self.stem_mod_idx = 0
+                else:
+                    self.selected_module_idx = 0
                 return
 
-            if self.editing_crossover:
+            if self.focus_zone == FocusZone.BANDS and self.editing_crossover:
                 p = self.get_selected_param()
                 if p:
                     self.editing = True
@@ -741,13 +809,13 @@ class GaiaTUI:
                 return
 
             modules_list = self.get_column_data(2)
-            if 0 <= self.selected_module_idx < len(modules_list):
-                item = modules_list[self.selected_module_idx]
+            if 0 <= cur_mod_idx < len(modules_list):
+                item = modules_list[cur_mod_idx]
                 
                 # Enter selection mode when [+] Add FX button is clicked
                 if item == "[+] Add FX":
                     cols = self.get_column_data(1)
-                    band = cols[self.selected_band_idx]
+                    band = cols[cur_col_idx]
                     if isinstance(band, Band):
                         # Pool of all available modules (classes)
                         module_pool = [
@@ -760,7 +828,10 @@ class GaiaTUI:
                         if available:
                             self.selecting_new_fx = True
                             self.available_fx_pool = available
-                            self.selected_module_idx = 0
+                            if self.focus_zone == FocusZone.STEMS:
+                                self.stem_mod_idx = 0
+                            else:
+                                self.selected_module_idx = 0
                             self.status_msg = "Select effect to add..."
                         else:
                             self.status_msg = "Band is full! Cannot add more FX."
@@ -801,7 +872,9 @@ class GaiaTUI:
                         self.status_msg = "Exporting..."
                         mix_idx = self.selected_mix_idx % len(self.population.mixes)
                         mix = self.population.mixes[mix_idx]
-                        exported_audio = self.engine.process(self.audio_data, mix)
+                        
+                        source = self.stems_data if self.stems_data is not None else self.audio_data
+                        exported_audio = self.engine.process(source, mix)
                         exported_audio = np.clip(exported_audio, -1.0, 1.0)
                         filename = f"{self.edit_buffer}.wav"
                         output_path = os.path.join(self.output_dir, filename)
@@ -856,10 +929,11 @@ class GaiaTUI:
             return
 
         # Delete FX Logic
-        if key == KEY_D and self.focus_zone == FocusZone.BANDS and not self.editing:
+        if key == KEY_D and self.focus_zone in (FocusZone.BANDS, FocusZone.STEMS) and not self.editing:
             modules_list = self.get_column_data(2)
-            if 0 <= self.selected_module_idx < len(modules_list):
-                item = modules_list[self.selected_module_idx]
+            cur_mod_idx = self.stem_mod_idx if self.focus_zone == FocusZone.STEMS else self.selected_module_idx
+            if 0 <= cur_mod_idx < len(modules_list):
+                item = modules_list[cur_mod_idx]
                 if not isinstance(item, str) and not isinstance(item, Parameter):
                     # It's an AudioModule
                     self.confirming_delete = True
@@ -867,6 +941,7 @@ class GaiaTUI:
                     return
 
         # Mix Sorting logic (Depth 0 = FocusZone.POPULATION)
+        # ... (mix sorting logic unchanged)
         if self.focus_zone == FocusZone.POPULATION:
             if key == KEY_SHIFT_UP:
                 idx = self.selected_mix_idx % len(self.population.mixes)
@@ -883,6 +958,7 @@ class GaiaTUI:
 
         # If in FILE_PICKER, handle remaining inputs
         if self.mode == "FILE_PICKER":
+            # ... (file picker logic unchanged)
             if key == KEY_UP:
                 self.selected_file_idx = (self.selected_file_idx - 1) % max(1, len(self.file_list))
             elif key == KEY_DOWN:
@@ -902,28 +978,38 @@ class GaiaTUI:
             self.refresh_file_list()
             return
         elif key == KEY_BRACKET_LEFT:
-            self.selected_band_idx = (self.selected_band_idx - 1) % len(self.get_column_data(1))
-            self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
+            if self.focus_zone == FocusZone.STEMS:
+                self.stem_col_idx = (self.stem_col_idx - 1) % len(self.get_column_data(1))
+                self.stem_mod_idx = 0; self.stem_param_idx = 0
+            else:
+                self.selected_band_idx = (self.selected_band_idx - 1) % len(self.get_column_data(1))
+                self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
             self.selecting_new_fx = False
         elif key == KEY_BRACKET_RIGHT:
-            self.selected_band_idx = (self.selected_band_idx + 1) % len(self.get_column_data(1))
-            self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
+            if self.focus_zone == FocusZone.STEMS:
+                self.stem_col_idx = (self.stem_col_idx + 1) % len(self.get_column_data(1))
+                self.stem_mod_idx = 0; self.stem_param_idx = 0
+            else:
+                self.selected_band_idx = (self.selected_band_idx + 1) % len(self.get_column_data(1))
+                self.selected_module_idx = 0; self.selected_param_idx = 0; self.editing_crossover = False
             self.selecting_new_fx = False
         elif key == KEY_M:
             cols = self.get_column_data(1)
-            band = cols[self.selected_band_idx]
+            cur_col_idx = self.stem_col_idx if self.focus_zone == FocusZone.STEMS else self.selected_band_idx
+            band = cols[cur_col_idx]
             if isinstance(band, Band):
                 band.is_muted = not band.is_muted
-                self.status_msg = f"Band {band.name} {'Muted' if band.is_muted else 'Unmuted'}"
+                self.status_msg = f"{band.name} {'Muted' if band.is_muted else 'Unmuted'}"
                 if self.is_playing:
                     idx = self.selected_mix_idx % len(self.population.mixes)
                     self.engine.update_mix(self.population.mixes[idx])
         elif key == KEY_S:
             cols = self.get_column_data(1)
-            band = cols[self.selected_band_idx]
+            cur_col_idx = self.stem_col_idx if self.focus_zone == FocusZone.STEMS else self.selected_band_idx
+            band = cols[cur_col_idx]
             if isinstance(band, Band):
                 band.is_soloed = not band.is_soloed
-                self.status_msg = f"Band {band.name} {'Soloed' if band.is_soloed else 'Unsoloed'}"
+                self.status_msg = f"{band.name} {'Soloed' if band.is_soloed else 'Unsoloed'}"
                 if self.is_playing:
                     idx = self.selected_mix_idx % len(self.population.mixes)
                     self.engine.update_mix(self.population.mixes[idx])
@@ -953,31 +1039,86 @@ class GaiaTUI:
             self.status_msg = "No stems available. Separate stems first."
             return
 
-        stem_name = self.stem_names[self.selected_stem_idx]
+        cols = self.get_column_data(1)
+        if self.stem_col_idx >= len(cols): self.stem_col_idx = 0
+        current_col = cols[self.stem_col_idx]
+        
+        # If selecting new FX, restrict navigation to the pool list
+        if self.selecting_new_fx:
+            if key == KEY_UP:
+                self.stem_mod_idx = (self.stem_mod_idx - 1) % len(self.available_fx_pool)
+            elif key == KEY_DOWN:
+                self.stem_mod_idx = (self.stem_mod_idx + 1) % len(self.available_fx_pool)
+            return
 
-        if key == KEY_LEFT:
-            self.selected_stem_idx = (self.selected_stem_idx - 1) % len(self.stem_names)
+        # Special case: Quick compare across columns
+        if key == KEY_CTRL_LEFT:
+            self.stem_col_idx = (self.stem_col_idx - 1) % len(cols)
+            return
+        elif key == KEY_CTRL_RIGHT:
+            self.stem_col_idx = (self.stem_col_idx + 1) % len(cols)
+            return
+
+        if key == KEY_UP:
+            if self.stem_param_idx > 0:
+                self.stem_param_idx -= 1
+            elif self.stem_mod_idx > 0:
+                self.stem_mod_idx -= 1
+                current_depth2 = self.get_column_data(2)
+                prev_mod = current_depth2[self.stem_mod_idx]
+                if hasattr(prev_mod, "parameters"):
+                    self.stem_param_idx = len(prev_mod.parameters) - 1
+                else:
+                    self.stem_param_idx = 0
+            elif self.stem_mod_idx == 0:
+                self.stem_mod_idx = -1
+                self.stem_param_idx = 0
+                
+        elif key == KEY_CTRL_UP:
+            if self.stem_mod_idx > 0:
+                self.stem_mod_idx -= 1
+                self.stem_param_idx = 0
+            elif self.stem_mod_idx == 0:
+                self.stem_mod_idx = -1
+                
+        elif key == KEY_DOWN:
+            current_depth2 = self.get_column_data(2)
+            if self.stem_mod_idx == -1:
+                if len(current_depth2) > 0:
+                    self.stem_mod_idx = 0
+                    self.stem_param_idx = 0
+                return
+
+            if 0 <= self.stem_mod_idx < len(current_depth2):
+                mod = current_depth2[self.stem_mod_idx]
+                num_params = len(mod.parameters) if hasattr(mod, "parameters") else 0
+                
+                if self.stem_param_idx < num_params - 1:
+                    self.stem_param_idx += 1
+                elif self.stem_mod_idx < len(current_depth2) - 1:
+                    self.stem_mod_idx += 1
+                    self.stem_param_idx = 0
+                    
+        elif key == KEY_CTRL_DOWN:
+            current_depth2 = self.get_column_data(2)
+            if self.stem_mod_idx == -1:
+                if current_depth2:
+                    self.stem_mod_idx = 0
+                    self.stem_param_idx = 0
+                return
+
+            if self.stem_mod_idx < len(current_depth2) - 1:
+                self.stem_mod_idx += 1
+                self.stem_param_idx = 0
+        
+        elif key == KEY_LEFT:
+            self.adjust_value(-1)
         elif key == KEY_RIGHT:
-            self.selected_stem_idx = (self.selected_stem_idx + 1) % len(self.stem_names)
-        elif key == KEY_M:
-            self.stem_mutes[stem_name] = not self.stem_mutes[stem_name]
-            self.status_msg = f"Stem {stem_name} {'Muted' if self.stem_mutes[stem_name] else 'Unmuted'}"
-        elif key == KEY_S:
-            self.stem_solos[stem_name] = not self.stem_solos[stem_name]
-            self.status_msg = f"Stem {stem_name} {'Soloed' if self.stem_solos[stem_name] else 'Unsoloed'}"
-        elif key in (KEY_UP, KEY_CTRL_UP, KEY_DOWN, KEY_CTRL_DOWN):
-            # Adjust gain for selected stem
-            step = 1.0 if key in (KEY_UP, KEY_DOWN) else 0.1
-            direction = 1 if key in (KEY_UP, KEY_CTRL_UP) else -1
-            
-            new_gain = self.stem_gains[stem_name] + (step * direction)
-            # Clamp between -60dB and +12dB
-            self.stem_gains[stem_name] = max(-60.0, min(12.0, new_gain))
-            
-            # Immediately trigger a mix refresh if playing
-            if self.is_playing:
-                idx = self.selected_mix_idx % len(self.population.mixes)
-                self.engine.update_mix(self.population.mixes[idx])
+            self.adjust_value(1)
+        elif key == KEY_SHIFT_UP: # Granular up
+            self.adjust_value(1, granular=True)
+        elif key == KEY_SHIFT_DOWN: # Granular down
+            self.adjust_value(-1, granular=True)
 
     def _handle_menu_input(self, key: str):
         if not self.header_menu.items: return
@@ -1202,15 +1343,15 @@ class GaiaTUI:
             idx = self.selected_mix_idx % len(self.population.mixes)
             mix = self.population.mixes[idx]
             
-            columns = self.get_column_data(1)
+            # Use explicit band list for layout, NOT get_column_data(1) which can switch to Stems
+            band_columns = [mix.pre_band] + mix.bands + [mix.post_band]
             band_layout = Layout(name="bands")
-            band_layout.split_row(*[Layout(name=f"col_{i}") for i in range(len(columns))])
+            band_layout.split_row(*[Layout(name=f"col_{i}") for i in range(len(band_columns))])
             
-            for i, item in enumerate(columns):
+            for i, band in enumerate(band_columns):
                 is_col_focused = (self.focus_zone == FocusZone.BANDS and self.selected_band_idx == i)
                 
                 # Rendering a Band (PRE, POST, or Frequency Band)
-                band = item
                 items = []
                 
                 # Mute / Solo indicators
@@ -1271,44 +1412,61 @@ class GaiaTUI:
                 prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s (Stopped)"
                 audio_panel = Panel(Text(prog_str, style="dim"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
 
-            # 3.5 Stems Row
-            stems_texts = []
+            # 3.5 Stems Row (Miller Columns)
+            stems_layout = Layout(name="stems")
             if self.is_separating:
                 bars_filled = int((self.separation_progress / 100.0) * 40)
                 bars_empty = 40 - bars_filled
                 p_bar = f"[{'█' * bars_filled}{'░' * bars_empty}]"
-                stems_texts.append(Text(f" Separating Stems... {p_bar} {self.separation_progress:.1f}% ", style="bold black on yellow"))
+                stem_panel = Panel(Text(f" Separating Stems... {p_bar} {self.separation_progress:.1f}% ", style="bold black on yellow"), border_style="yellow")
+                stems_layout.update(stem_panel)
             elif not self.stems_data:
-                stems_texts.append(Text(" No Stems (Use File -> Separate Stems) ", style="dim"))
+                stem_panel = Panel(Text(" No Stems (Use Stems -> Separate Stems) ", style="dim"), border_style="dim")
+                stems_layout.update(stem_panel)
             else:
-                for i, stem in enumerate(self.stem_names):
-                    is_sel = (self.focus_zone == FocusZone.STEMS and i == self.selected_stem_idx)
-                    gain_str = f"{self.stem_gains[stem]:+.1f}dB"
+                stems_layout.split_row(*[Layout(name=f"stem_col_{i}") for i in range(len(self.stem_names))])
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                mix = self.population.mixes[idx]
+                
+                for i, stem_name in enumerate(self.stem_names):
+                    is_col_focused = (self.focus_zone == FocusZone.STEMS and self.stem_col_idx == i)
+                    band = mix.stem_bands[stem_name]
+                    items = []
                     
-                    # Status flags
-                    flags = []
-                    if self.stem_mutes.get(stem, False): flags.append("M")
-                    if self.stem_solos.get(stem, False): flags.append("S")
-                    flag_str = f"[{''.join(flags)}]" if flags else "   "
-                    
-                    style = "bold white on blue" if is_sel else "cyan"
-                    if self.stem_mutes.get(stem, False) and not self.stem_solos.get(stem, False):
-                        style = "dim red"
-                    elif self.stem_solos.get(stem, False):
-                        style = "bold yellow"
-                        
-                    stems_texts.append(Text(f" {flag_str} {stem.upper()}: {gain_str} ", style=style))
+                    # Mute / Solo indicators
+                    ms_text = Text("")
+                    if band.is_soloed: ms_text.append("[S]", style="bold black on yellow")
+                    if band.is_muted: ms_text.append("[M]", style="bold white on red")
+                    if len(ms_text) > 0: items.append(ms_text)
 
-            stems_border_style = "dim"
-            if self.focus_zone == FocusZone.STEMS:
-                stems_border_style = "red" if self.is_separating else "magenta"
-            stems_panel = Panel(Columns(stems_texts, expand=True, align="center"), border_style=stems_border_style, title="Pre-Mix Stems")
+                    # Subtitle: Gain
+                    is_gain_sel = is_col_focused and self.stem_mod_idx == -1
+                    gain_val = self.edit_buffer if (is_gain_sel and self.editing) else f"{band.gain.current_value:.1f}"
+                    if band.gain.is_locked: gain_val = f"*{gain_val}"
+                    gain_style = "bold black on yellow" if (is_gain_sel and self.editing) else "bold white on blue" if is_gain_sel else "white"
+                    stem_subtitle = Text(f" {stem_name.upper()} | {gain_val}dB ", style=gain_style)
+
+                    # Modules
+                    if is_col_focused:
+                        modules_to_render = self.get_column_data(2)
+                    else:
+                        modules_to_render = band.modules
+                    
+                    items.append(self.render_column_content(modules_to_render, 2, is_focused=is_col_focused))
+                    
+                    stem_panel = Panel(
+                        Group(*items), 
+                        subtitle=stem_subtitle,
+                        subtitle_align="center",
+                        border_style="blue" if is_col_focused else "dim"
+                    )
+                    stems_layout[f"stem_col_{i}"].update(stem_panel)
 
             # Final Assembly of Evolution mode
             layout.split_column(
                 Layout(header_panel, size=3),
                 Layout(pop_panel, size=3),
-                Layout(stems_panel, size=3),
+                Layout(stems_layout, ratio=1),
                 band_layout, # takes remaining ratio=1
                 Layout(audio_panel, size=3),
                 Layout(status_panel, size=3)

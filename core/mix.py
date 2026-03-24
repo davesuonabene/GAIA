@@ -14,6 +14,12 @@ class Mix:
         Initializes a Mix with the given crossover frequencies.
         Crossovers are stored as evolvable Parameter objects.
         """
+        self.stem_bands = {
+            "vocals": Band("Vocals"),
+            "drums": Band("Drums"),
+            "bass": Band("Bass"),
+            "other": Band("Other")
+        }
         self.pre_band = Band("PRE")
         self.post_band = Band("POST")
         
@@ -39,6 +45,7 @@ class Mix:
     def to_dict(self) -> dict:
         """Serialize mix to a dictionary."""
         return {
+            "stem_bands": {k: v.to_dict() for k, v in self.stem_bands.items()},
             "crossover_params": [p.to_dict() for p in self.crossover_params],
             "pre_band": self.pre_band.to_dict(),
             "bands": [b.to_dict() for b in self.bands],
@@ -50,6 +57,9 @@ class Mix:
         """Reconstruct mix from a dictionary."""
         # Create a basic Mix instance with dummy crossovers
         instance = cls(crossovers=[])
+        
+        if "stem_bands" in data:
+            instance.stem_bands = {k: Band.from_dict(v) for k, v in data["stem_bands"].items()}
         
         if "crossover_params" in data:
             instance.crossover_params = [Parameter.from_dict(p) for p in data["crossover_params"]]
@@ -92,7 +102,12 @@ class Mix:
         # Sort and rename crossover parameters to maintain band order
         self.sort_crossovers()
         
-        # 2. Mutate bands (PRE, POST, and individual frequency bands)
+        # 2. Mutate stem bands
+        for band in self.stem_bands.values():
+            band.mutate_structure(structural_mutation_rate)
+            band.mutate_parameters(parametric_mutation_rate)
+
+        # 3. Mutate bands (PRE, POST, and individual frequency bands)
         for band in [self.pre_band] + self.bands + [self.post_band]:
             band.mutate_structure(structural_mutation_rate)
             band.mutate_parameters(parametric_mutation_rate)

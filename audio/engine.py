@@ -35,6 +35,7 @@ class Engine:
         self.lock = threading.Lock()
         
         # Cached DSP components
+        self._stem_boards: Dict[str, Optional[pedalboard.Pedalboard]] = {}
         self._pre_board: Optional[pedalboard.Pedalboard] = None
         self._band_boards: List[Optional[pedalboard.Pedalboard]] = []
         self._post_board: Optional[pedalboard.Pedalboard] = None
@@ -42,6 +43,7 @@ class Engine:
         self._safety_limiter = pedalboard.Limiter(threshold_db=-0.1) if pedalboard else None
         
         # State for solo/mute/gain
+        self._stem_states: Dict[str, dict] = {}
         self._band_states = [] # List of dicts: {'solo': bool, 'mute': bool, 'gain': float}
 
     def _compile_board(self, band_dna: Band) -> pedalboard.Pedalboard:
@@ -56,6 +58,17 @@ class Engine:
     def update_mix(self, mix_dna: Mix):
         """Compiles the DSP state from the Mix DNA. Thread-safe."""
         with self.lock:
+            # 0. Compile Stem bands
+            self._stem_boards = {}
+            self._stem_states = {}
+            for name, band in mix_dna.stem_bands.items():
+                self._stem_boards[name] = self._compile_board(band)
+                self._stem_states[name] = {
+                    'soloed': band.is_soloed,
+                    'muted': band.is_muted,
+                    'gain': 10 ** (band.gain.current_value / 20.0)
+                }
+
             # 1. Compile PRE band
             self._pre_board = self._compile_board(mix_dna.pre_band)
 
@@ -80,14 +93,57 @@ class Engine:
             else:
                 self._crossover.update_crossovers(crossover_freqs)
 
-    def process_chunk(self, input_chunk: np.ndarray) -> np.ndarray:
-        """Processes a small chunk of audio through the compiled DSP chains."""
+    def process_chunk(self, input_chunk: Any) -> np.ndarray:
+        """
+        Processes a small chunk of audio through the compiled DSP chains.
+        Input can be an ndarray (standard) or a dict of stem ndarrays.
+        """
         with self.lock:
+            # 0. Stem Processing (if input is dict)
+            if isinstance(input_chunk, dict):
+                if not input_chunk:
+                    return np.array([])
+                
+                # Determine target shape from first stem
+                first_stem = next(iter(input_chunk.values()))
+                num_channels, num_samples = first_stem.shape
+                summed = np.zeros((num_channels, num_samples), dtype=np.float32)
+                
+                solo_active = any(self._stem_states[name]['soloed'] for name in input_chunk)
+                
+                for name, audio in input_chunk.items():
+                    state = self._stem_states.get(name)
+                    board = self._stem_boards.get(name)
+                    if state is None or board is None: continue
+                    
+                    if solo_active:
+                        if not state['soloed']: continue
+                    elif state['muted']:
+                        continue
+                        
+                    # Match length if necessary (pad or truncate)
+                    chunk = audio
+                    if chunk.shape[1] != num_samples:
+                        if chunk.shape[1] > num_samples:
+                            chunk = chunk[:, :num_samples]
+                        else:
+                            temp = np.zeros((num_channels, num_samples), dtype=np.float32)
+                            temp[:, :chunk.shape[1]] = chunk
+                            chunk = temp
+                    
+                    # Process and sum
+                    # Empty pedalboard acts as a passthrough
+                    processed = board.process(chunk, self.sample_rate)
+                    summed += processed * state['gain']
+                current_audio = summed
+            else:
+                current_audio = input_chunk
+
             if self._pre_board is None:
-                return input_chunk
+                return current_audio
 
             # 1. PRE-FX
-            current_audio = self._pre_board.process(input_chunk, self.sample_rate)
+            current_audio = self._pre_board.process(current_audio, self.sample_rate)
 
             # 2. Split into bands
             bands_audio = self._crossover.split_chunk(current_audio)
@@ -126,8 +182,8 @@ class Engine:
             
             return final_audio
 
-    def process(self, input_audio: np.ndarray, mix_dna: Mix) -> np.ndarray:
-        """Legacy method for full-file processing, now uses chunking logic for consistency."""
+    def process(self, input_audio: Any, mix_dna: Mix) -> np.ndarray:
+        """Processes audio (ndarray or dict of stems) through the Mix DNA."""
         self.update_mix(mix_dna)
         return self.process_chunk(input_audio)
 
