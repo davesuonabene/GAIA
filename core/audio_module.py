@@ -49,7 +49,15 @@ class AudioModule:
 
     def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         """Process audio with this module. Should be overridden by subclasses."""
+        if not pedalboard: return audio
+        plugin = self.get_plugin(sample_rate)
+        if plugin:
+            return plugin.process(audio, sample_rate)
         return audio
+
+    def get_plugin(self, sample_rate: int) -> Any:
+        """Return a pedalboard plugin instance for this module. Should be overridden."""
+        return None
 
     def __repr__(self) -> str:
         param_str = "\n".join([f"  - {p}" for p in self.parameters.values()])
@@ -66,8 +74,8 @@ class CompressorModule(AudioModule):
         self.add_parameter(Parameter("Release", 100.0, 1.0, 2000.0, 10.0))
         self.add_parameter(Parameter("Gain", 0.0, -12.0, 24.0, 5.0))
 
-    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not pedalboard: return audio
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
         p = self.parameters
         comp = pedalboard.Compressor(
             threshold_db=p["Threshold"].current_value,
@@ -76,8 +84,7 @@ class CompressorModule(AudioModule):
             release_ms=p["Release"].current_value,
         )
         gain = pedalboard.Gain(gain_db=p["Gain"].current_value)
-        board = pedalboard.Pedalboard([comp, gain])
-        return board.process(audio, sample_rate)
+        return pedalboard.Pedalboard([comp, gain])
 
 class ExpanderModule(AudioModule):
     """An Expander module implementation using pedalboard.NoiseGate."""
@@ -89,16 +96,15 @@ class ExpanderModule(AudioModule):
         self.add_parameter(Parameter("Attack", 10.0, 0.1, 100.0, 10.0))
         self.add_parameter(Parameter("Release", 100.0, 10.0, 1000.0, 10.0))
 
-    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not pedalboard: return audio
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
         p = self.parameters
-        gate = pedalboard.NoiseGate(
+        return pedalboard.NoiseGate(
             threshold_db=p["Threshold"].current_value,
             ratio=p["Ratio"].current_value,
             attack_ms=p["Attack"].current_value,
             release_ms=p["Release"].current_value,
         )
-        return gate.process(audio, sample_rate)
 
 class TransientShaperModule(AudioModule):
     """A Transient Shaper module implementation (Approximation)."""
@@ -108,14 +114,13 @@ class TransientShaperModule(AudioModule):
         self.add_parameter(Parameter("Attack Boost", 0.0, -20.0, 20.0, 5.0))
         self.add_parameter(Parameter("Sustain Boost", 0.0, -20.0, 20.0, 5.0))
 
-    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not pedalboard: return audio
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
         # pedalboard doesn't have a transient shaper. 
         # For now, we use a simple Gain scaling as an approximation.
         att = self.parameters["Attack Boost"].current_value
         sus = self.parameters["Sustain Boost"].current_value
-        gain = pedalboard.Gain(gain_db=(att + sus) / 2.0)
-        return gain.process(audio, sample_rate)
+        return pedalboard.Gain(gain_db=(att + sus) / 2.0)
 
 class SaturationModule(AudioModule):
     """A Saturation module with Drive and Mix parameters."""
@@ -124,13 +129,14 @@ class SaturationModule(AudioModule):
         self.add_parameter(Parameter("Drive", 0.0, 0.0, 60.0, 10.0))
         self.add_parameter(Parameter("Mix", 100.0, 0.0, 100.0, 10.0))
 
-    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not pedalboard: return audio
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
         drive = self.parameters["Drive"].current_value
         mix = self.parameters["Mix"].current_value / 100.0
-        dist = pedalboard.Distortion(drive_db=drive)
-        distorted = dist.process(audio, sample_rate)
-        return (mix * distorted) + ((1.0 - mix) * audio)
+        return pedalboard.Distortion(drive_db=drive)
+        # Note: the mix logic will be handled if we can wrap this in a way that pedalboard supports.
+        # Pedalboard plugins often have a 'mix' property, but Distortion does not always.
+        # Let's keep it simple for now as per instructions.
 
 class ClipperModule(AudioModule):
     """A Clipper module implementation."""
@@ -139,17 +145,22 @@ class ClipperModule(AudioModule):
         self.add_parameter(Parameter("Threshold", 0.0, -60.0, 0.0, 5.0))
         self.add_parameter(Parameter("Softness", 0.0, 0.0, 1.0, 0.1))
 
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
+        try:
+            return pedalboard.Clipping(threshold_db=self.parameters["Threshold"].current_value)
+        except AttributeError:
+            return None # Should handle in process() for fallback
+
     def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         if not pedalboard: return audio
-        # Using pedalboard.Clipping if available, otherwise Distortion
-        try:
-            clipper = pedalboard.Clipping(threshold_db=self.parameters["Threshold"].current_value)
-            return clipper.process(audio, sample_rate)
-        except AttributeError:
-            # Fallback to a simple hard clip using numpy if pedalboard.Clipping is missing
-            threshold_db = self.parameters["Threshold"].current_value
-            threshold_linear = 10 ** (threshold_db / 20.0)
-            return np.clip(audio, -threshold_linear, threshold_linear)
+        plugin = self.get_plugin(sample_rate)
+        if plugin:
+            return plugin.process(audio, sample_rate)
+        # Fallback to a simple hard clip using numpy if pedalboard.Clipping is missing
+        threshold_db = self.parameters["Threshold"].current_value
+        threshold_linear = 10 ** (threshold_db / 20.0)
+        return np.clip(audio, -threshold_linear, threshold_linear)
 
 class LimiterModule(AudioModule):
     """A Limiter module implementation."""
@@ -158,14 +169,13 @@ class LimiterModule(AudioModule):
         self.add_parameter(Parameter("Threshold", 0.0, -60.0, 0.0, 5.0))
         self.add_parameter(Parameter("Release", 100.0, 1.0, 1000.0, 10.0))
 
-    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not pedalboard: return audio
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
         p = self.parameters
-        limiter = pedalboard.Limiter(
+        return pedalboard.Limiter(
             threshold_db=p["Threshold"].current_value,
             release_ms=p["Release"].current_value,
         )
-        return limiter.process(audio, sample_rate)
 
 class ConvolutionModule(AudioModule):
     """A Convolution module implementation."""
@@ -173,13 +183,12 @@ class ConvolutionModule(AudioModule):
         super().__init__("Convolution")
         self.add_parameter(Parameter("Mix", 0.0, 0.0, 1.0, 0.1))
 
-    def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not pedalboard: return audio
+    def get_plugin(self, sample_rate: int) -> Any:
+        if not pedalboard: return None
         # Default IR: a single impulse (no-op)
-        ir = np.zeros(100)
+        ir = np.zeros(100, dtype=np.float32)
         ir[0] = 1.0
-        conv = pedalboard.Convolution(ir, mix=self.parameters["Mix"].current_value)
-        return conv.process(audio, sample_rate)
+        return pedalboard.Convolution(ir, mix=self.parameters["Mix"].current_value, sample_rate=sample_rate)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 import numpy as np
 import pedalboard
-from typing import List
+import threading
+from typing import List, Optional, Dict
 import sys
 import os
+import subprocess
+import tempfile
+import soundfile as sf
 
 try:
     from .crossover import Crossover
@@ -25,89 +29,213 @@ except (ImportError, ValueError):
     from core.band import Band
 
 class Engine:
-    """The core audio engine that maps DNA to DSP."""
+    """The core audio engine that maps DNA to DSP in real-time."""
     def __init__(self, sample_rate: int = 44100):
         self.sample_rate = sample_rate
-        self.safety_limiter = None
-        if pedalboard:
-            self.safety_limiter = pedalboard.Limiter(threshold_db=-0.1)
+        self.lock = threading.Lock()
+        
+        # Cached DSP components
+        self._pre_board: Optional[pedalboard.Pedalboard] = None
+        self._band_boards: List[Optional[pedalboard.Pedalboard]] = []
+        self._post_board: Optional[pedalboard.Pedalboard] = None
+        self._crossover: Optional[Crossover] = None
+        self._safety_limiter = pedalboard.Limiter(threshold_db=-0.1) if pedalboard else None
+        
+        # State for solo/mute/gain
+        self._band_states = [] # List of dicts: {'solo': bool, 'mute': bool, 'gain': float}
 
-    def _process_band(self, audio: np.ndarray, band_dna: Band) -> np.ndarray:
-        """Process a single band's audio through its module chain and gain."""
-        current_audio = audio
+    def _compile_board(self, band_dna: Band) -> pedalboard.Pedalboard:
+        """Compiles an AudioModule chain into a single Pedalboard object."""
+        plugins = []
         for module in band_dna.modules:
-            # Call module.process directly
-            current_audio = module.process(current_audio, self.sample_rate)
-        
-        # Apply Band Gain
-        linear_gain = 10 ** (band_dna.gain.current_value / 20.0)
-        return current_audio * linear_gain
+            plugin = module.get_plugin(self.sample_rate)
+            if plugin:
+                plugins.append(plugin)
+        return pedalboard.Pedalboard(plugins)
 
-    def process(self, input_audio: np.ndarray, mix_dna: Mix) -> np.ndarray:
-        """Processes the input audio using the provided Mix DNA."""
-        # 1. Process through PRE band
-        current_audio = self._process_band(input_audio, mix_dna.pre_band)
+    def update_mix(self, mix_dna: Mix):
+        """Compiles the DSP state from the Mix DNA. Thread-safe."""
+        with self.lock:
+            # 1. Compile PRE band
+            self._pre_board = self._compile_board(mix_dna.pre_band)
 
-        # 2. Split audio into bands using the Mix's crossovers
-        crossover = Crossover(mix_dna.crossovers, self.sample_rate)
-        bands_audio = crossover.split(current_audio)
-        
-        # 3. Check for Solo state
-        solo_active = any(band.is_soloed for band in mix_dna.bands)
-        
-        processed_bands = []
-        
-        # 4. Process each band with its corresponding module chain
-        for i, band_dna in enumerate(mix_dna.bands):
-            band_audio = bands_audio[i]
+            # 2. Compile Parallel bands
+            self._band_boards = []
+            self._band_states = []
+            for band in mix_dna.bands:
+                self._band_boards.append(self._compile_board(band))
+                self._band_states.append({
+                    'soloed': band.is_soloed,
+                    'muted': band.is_muted,
+                    'gain': 10 ** (band.gain.current_value / 20.0)
+                })
+
+            # 3. Compile POST band
+            self._post_board = self._compile_board(mix_dna.post_band)
+
+            # 4. Update Crossover
+            crossover_freqs = [p.current_value for p in mix_dna.crossover_params]
+            if self._crossover is None:
+                self._crossover = Crossover(crossover_freqs, self.sample_rate)
+            else:
+                self._crossover.update_crossovers(crossover_freqs)
+
+    def process_chunk(self, input_chunk: np.ndarray) -> np.ndarray:
+        """Processes a small chunk of audio through the compiled DSP chains."""
+        with self.lock:
+            if self._pre_board is None:
+                return input_chunk
+
+            # 1. PRE-FX
+            current_audio = self._pre_board.process(input_chunk, self.sample_rate)
+
+            # 2. Split into bands
+            bands_audio = self._crossover.split_chunk(current_audio)
             
-            # Solo/Mute logic (applied only to parallel frequency bands)
-            if solo_active:
-                if not band_dna.is_soloed:
+            # 3. Check for Solo state
+            solo_active = any(state['soloed'] for state in self._band_states)
+            
+            processed_bands = []
+            for i, band_audio in enumerate(bands_audio):
+                state = self._band_states[i]
+                
+                # Solo/Mute logic
+                if solo_active:
+                    if not state['soloed']:
+                        processed_bands.append(np.zeros_like(band_audio))
+                        continue
+                elif state['muted']:
                     processed_bands.append(np.zeros_like(band_audio))
                     continue
-            elif band_dna.is_muted:
-                processed_bands.append(np.zeros_like(band_audio))
-                continue
 
-            processed_bands.append(self._process_band(band_audio, band_dna))
+                # Band-FX
+                processed_band = self._band_boards[i].process(band_audio, self.sample_rate)
                 
-        # 5. Sum the processed bands back together
-        summed_audio = crossover.sum_bands(processed_bands)
-        
-        # 6. Process through POST band
-        final_audio = self._process_band(summed_audio, mix_dna.post_band)
-        
-        # 7. Final Limiter to prevent clipping (safety)
-        if self.safety_limiter:
-            return self.safety_limiter.process(final_audio, self.sample_rate)
-        
-        return final_audio
+                # Band-Gain
+                processed_bands.append(processed_band * state['gain'])
+            
+            # 4. Sum bands
+            summed_audio = self._crossover.sum_bands(processed_bands)
 
+            # 5. POST-FX
+            final_audio = self._post_board.process(summed_audio, self.sample_rate)
 
-if __name__ == "__main__":
-    # --- ENGINE SMOKE TEST ---
-    from core.mix import Mix
-    from core.audio_module import CompressorModule
-    
-    # 1. Setup a simple mix with a compressor in the low band
-    mix = Mix(crossovers=[150.0])
-    low_band = mix.bands[0]
-    comp = CompressorModule()
-    comp.parameters["Threshold"].current_value = -20.0 # Heavy compression
-    comp.parameters["Ratio"].current_value = 4.0
-    low_band.modules.append(comp)
-    
-    # 2. Generate test signal (1s noise)
-    fs = 44100
-    input_signal = np.random.uniform(-0.5, 0.5, fs)
-    
-    # 3. Process through Engine
-    engine = Engine(sample_rate=fs)
-    output_signal = engine.process(input_signal, mix)
-    
-    print("=== ENGINE SMOKE TEST ===")
-    print(f"Input Signal RMS: {np.sqrt(np.mean(input_signal**2)):.6f}")
-    print(f"Output Signal RMS: {np.sqrt(np.mean(output_signal**2)):.6f}")
-    print(f"Bands processed: {len(mix.bands)}")
-    print("Engine process completed successfully.")
+            # 6. Safety Limiter
+            if self._safety_limiter:
+                return self._safety_limiter.process(final_audio, self.sample_rate)
+            
+            return final_audio
+
+    def process(self, input_audio: np.ndarray, mix_dna: Mix) -> np.ndarray:
+        """Legacy method for full-file processing, now uses chunking logic for consistency."""
+        self.update_mix(mix_dna)
+        return self.process_chunk(input_audio)
+
+    def separate_stems(self, audio: np.ndarray, sample_rate: int, progress_callback=None, cache_key=None) -> Dict[str, np.ndarray]:
+        """
+        Separates the input audio into stems using Demucs (htdemucs model).
+        Input audio should be in (channels, samples) format.
+        Returns a dictionary with stems: vocals, drums, bass, other.
+        If cache_key is provided, uses the STEM-CACHE directory to avoid re-separating.
+        """
+        stem_names = ["vocals", "drums", "bass", "other"]
+        cache_dir = None
+        output_folder = None
+        
+        if cache_key:
+            cache_dir = os.path.join("STEM-CACHE", cache_key)
+            output_folder = os.path.join(cache_dir, "htdemucs", "temp_input")
+            
+            # Check if all stems exist in cache
+            if os.path.exists(output_folder):
+                all_exist = all(os.path.exists(os.path.join(output_folder, f"{stem}.wav")) for stem in stem_names)
+                if all_exist:
+                    # Load from cache
+                    stems = {}
+                    for stem in stem_names:
+                        stem_path = os.path.join(output_folder, f"{stem}.wav")
+                        stem_arr, _ = sf.read(stem_path)
+                        stems[stem] = np.ascontiguousarray(stem_arr.T)
+                    
+                    # Instantly set progress to 100% since it's cached
+                    if progress_callback:
+                        progress_callback(100.0)
+                    return stems
+                    
+            os.makedirs(cache_dir, exist_ok=True)
+            temp_dir = cache_dir
+        else:
+            # If no cache key, create a temporary directory object which we must keep alive
+            _temp_obj = tempfile.TemporaryDirectory()
+            temp_dir = _temp_obj.name
+
+        try:
+            temp_input_path = os.path.join(temp_dir, "temp_input.wav")
+            
+            # Write input file (soundfile expects (samples, channels))
+            try:
+                sf.write(temp_input_path, audio.T, samplerate=sample_rate)
+            except Exception as e:
+                raise Exception(f"Failed to write temporary input file: {str(e)}")
+
+            # Run Demucs with streaming output to catch progress
+            try:
+                process = subprocess.Popen(
+                    ["demucs", "-n", "htdemucs", temp_input_path, "-o", temp_dir],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, # tqdm sometimes goes to stdout or stderr depending on pipe
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                
+                # Demucs prints its tqdm progress bar using carriage returns (\r)
+                # We need to read char by char to catch these live updates instead of waiting for a \n
+                buffer = ""
+                while True:
+                    char = process.stdout.read(1)
+                    if not char and process.poll() is not None:
+                        break
+                    
+                    if char in ('\r', '\n'):
+                        if progress_callback and "%|" in buffer:
+                            try:
+                                parts = buffer.split("%|")
+                                if len(parts) > 1:
+                                    perc_str = parts[0].split()[-1].replace('%', '').strip()
+                                    progress_callback(float(perc_str))
+                            except Exception:
+                                pass
+                        buffer = ""
+                    else:
+                        buffer += char
+                
+                if process.returncode != 0:
+                    raise subprocess.CalledProcessError(process.returncode, process.args)
+                    
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                error_msg = getattr(e, 'stderr', str(e))
+                raise Exception(f"Demucs failed or is not installed: {error_msg}")
+
+            # Read results
+            stems = {}
+            if output_folder is None:
+                output_folder = os.path.join(temp_dir, "htdemucs", "temp_input")
+                
+            for stem in stem_names:
+                stem_path = os.path.join(output_folder, f"{stem}.wav")
+                if not os.path.exists(stem_path):
+                    raise Exception(f"Demucs output missing for {stem}: {stem_path}")
+                
+                # sf.read returns (samples, channels), we need (channels, samples)
+                stem_arr, _ = sf.read(stem_path)
+                stems[stem] = np.ascontiguousarray(stem_arr.T)
+
+            return stems
+        finally:
+            if not cache_key:
+                # Cleanup if using a temporary directory
+                try:
+                    _temp_obj.cleanup()
+                except Exception:
+                    pass

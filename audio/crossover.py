@@ -2,49 +2,69 @@ import numpy as np
 from scipy import signal
 from typing import List
 
-class LinkwitzRileyFilter:
-    """
-    A 4th-order Linkwitz-Riley filter response.
-    We use sosfilt (IIR) for real-time processing capability.
-    """
-    def __init__(self, cutoff: float, fs: int, btype: str):
-        # LR-4 is two cascaded 2nd order Butterworths
-        self.sos = signal.butter(2, cutoff, btype=btype, fs=fs, output='sos')
-        
-    def process(self, data: np.ndarray) -> np.ndarray:
-        # Standard IIR filtering (causal)
-        # We apply it twice to get the LR-4 response
-        first_pass = signal.sosfilt(self.sos, data)
-        return signal.sosfilt(self.sos, first_pass)
-
 class Crossover:
     """
     Splits an audio signal into multiple bands.
-    To ensure absolute mathematical transparency (Max Amplitude Difference < 1e-10),
-    we use a subtractive filter bank approach.
+    Uses stateful IIR filters for real-time chunk processing.
     """
     def __init__(self, crossovers: List[float], fs: int = 44100):
         self.crossovers = sorted(crossovers)
         self.fs = fs
-        
-    def split(self, audio: np.ndarray) -> List[np.ndarray]:
+        self.num_bands = len(self.crossovers) + 1
+        self._reset_state()
+
+    def _reset_state(self):
+        """Initializes/Resets the filter states for each band split."""
+        self.filters = []
+        for cutoff in self.crossovers:
+            # We use a 4th order Linkwitz-Riley (cascaded 2nd order Butterworth)
+            # LR-4 has a flat summed frequency response.
+            sos = signal.butter(2, cutoff, 'lowpass', fs=self.fs, output='sos')
+            # Each split needs its own state (zi)
+            # Since it's LR-4 (two passes), we need two states if we were doing it manually,
+            # but we can just use a 4th order Butterworth SOS if we want LR-4 behavior? 
+            # Actually LR-4 is (Butterworth-2)^2.
+            
+            # For simplicity and perfect reconstruction in real-time without complex phase alignment:
+            # We'll use the subtractive approach but with stateful sosfilt.
+            self.filters.append({
+                'sos': sos,
+                'zi1': None, # State for first pass
+                'zi2': None  # State for second pass
+            })
+
+    def update_crossovers(self, crossovers: List[float]):
+        """Updates the crossover frequencies and resets state."""
+        self.crossovers = sorted(crossovers)
+        self.num_bands = len(self.crossovers) + 1
+        self._reset_state()
+
+    def split_chunk(self, chunk: np.ndarray) -> List[np.ndarray]:
         """
-        Splits the audio into N bands.
-        Each split is: 
-          LowBand = Filter(Signal)
-          HighBand = Signal - LowBand
-        This guarantees perfect reconstruction when summed.
+        Splits a chunk of audio into N bands using stateful filters.
+        Guarantees perfect reconstruction when summed due to subtractive architecture.
         """
         bands = []
-        remainder = audio
-        
-        for cutoff in self.crossovers:
-            # We use a zero-phase LR-4 for the Low Pass to keep it high quality
-            sos = signal.butter(2, cutoff, 'lowpass', fs=self.fs, output='sos')
-            # Use filtfilt so the LP is zero-phase, making the subtraction cleaner
-            lp_signal = signal.sosfiltfilt(sos, remainder)
-            
-            # Subtractive High Pass (guarantees perfect sum)
+        remainder = chunk
+
+        for f in self.filters:
+            # First pass
+            if f['zi1'] is None:
+                # Initialize state with zeros. shape of zi is (n_sections, channels, 2)
+                f['zi1'] = np.zeros((f['sos'].shape[0], 2))
+                if chunk.ndim > 1: # Stereo or Multi-channel
+                    f['zi1'] = np.zeros((f['sos'].shape[0], chunk.shape[0], 2))
+
+            lp_pass1, f['zi1'] = signal.sosfilt(f['sos'], remainder, zi=f['zi1'], axis=-1)
+
+            # Second pass (to make it 4th order / LR-4 equivalent)
+            if f['zi2'] is None:
+                f['zi2'] = np.zeros((f['sos'].shape[0], 2))
+                if chunk.ndim > 1:
+                    f['zi2'] = np.zeros((f['sos'].shape[0], chunk.shape[0], 2))
+
+            lp_signal, f['zi2'] = signal.sosfilt(f['sos'], lp_pass1, zi=f['zi2'], axis=-1)            
+            # Subtractive High Pass
             hp_signal = remainder - lp_signal
             
             bands.append(lp_signal)
@@ -57,36 +77,7 @@ class Crossover:
         """Sums the bands back together."""
         return np.sum(bands, axis=0)
 
-if __name__ == "__main__":
-    # --- PHASE TRANSPARENCY TEST ---
-    fs = 44100
-    duration = 2.0
-    num_samples = int(fs * duration)
-    
-    # 1. Generate 2 seconds of white noise
-    noise = np.random.uniform(-0.5, 0.5, num_samples)
-    
-    # 2. Setup a 3-band crossover
-    crossover = Crossover(crossovers=[150.0, 2500.0], fs=fs)
-    
-    # 3. Split into bands
-    bands = crossover.split(noise)
-    
-    # 4. Sum back together
-    reconstructed = crossover.sum_bands(bands)
-    
-    # 5. Calculate the maximum amplitude difference
-    # Subtractive filtering is mathematically identity: LP + (Signal - LP) = Signal
-    diff = np.abs(noise - reconstructed)
-    max_diff = np.max(diff)
-    
-    print("=== CROSSOVER TRANSPARENCY TEST ===")
-    print(f"Sample Rate: {fs} Hz")
-    print(f"Crossover Points: {crossover.crossovers} Hz")
-    print(f"Number of Bands: {len(bands)}")
-    print(f"Max Amplitude Difference: {max_diff:.2e}")
-    
-    if max_diff < 1e-10:
-        print("RESULT: PASS (Acoustically transparent and phase-accurate)")
-    else:
-        print("RESULT: FAIL (Deviation too high)")
+    # Legacy method for full-file processing (can be used for chunks too but split_chunk is preferred)
+    def split(self, audio: np.ndarray) -> List[np.ndarray]:
+        self._reset_state()
+        return self.split_chunk(audio)

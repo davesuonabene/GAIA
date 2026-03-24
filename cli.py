@@ -5,6 +5,7 @@ import time
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
+import threading
 from typing import List, Any, Callable, Optional
 from enum import Enum, auto
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ class FocusZone(Enum):
     POPULATION = auto()
     BANDS = auto()
     PLAYBACK = auto()
+    STEMS = auto()
 
 @dataclass
 class MenuItem:
@@ -155,11 +157,12 @@ def get_key(fd):
         return None
 
 class GaiaTUI:
-    def __init__(self, population: Population, audio_data: np.ndarray, sample_rate: int, output_dir: str):
+    def __init__(self, population: Population, audio_data: np.ndarray, sample_rate: int, output_dir: str, blocksize: int = 512):
         self.population = population
         self.audio_data = audio_data
         self.sample_rate = sample_rate
         self.output_dir = output_dir
+        self.blocksize = blocksize
         
         # Navigation State
         self.focus_zone = FocusZone.POPULATION
@@ -170,14 +173,28 @@ class GaiaTUI:
                 MenuItem(title="Save Preset", action=self.action_save_preset_flow),
                 MenuItem(title="Export Track", action=self.action_export_track_flow),
             ]),
+            MenuItem(title="Stems", children=[
+                MenuItem(title="Separate Stems", action=self.action_separate_stems),
+            ]),
         ])
         self.metadata = TrackMetadata()
+        self.current_filename = None
         self.selected_mix_idx = 0
         self.selected_file_idx = 0 # Separate index for file browser
         self.selected_band_idx = 0
         self.selected_module_idx = 0
         self.selected_param_idx = 0
         self.editing_crossover = False
+        
+        # Stem Separation State
+        self.is_separating = False
+        self.separation_progress = 0.0
+        self.stems_data = None
+        self.stem_gains = {"vocals": 0.0, "drums": 0.0, "bass": 0.0, "other": 0.0}
+        self.stem_mutes = {"vocals": False, "drums": False, "bass": False, "other": False}
+        self.stem_solos = {"vocals": False, "drums": False, "bass": False, "other": False}
+        self.selected_stem_idx = 0
+        self.stem_names = ["vocals", "drums", "bass", "other"]
         
         # FX Selection Mode
         self.selecting_new_fx = False
@@ -197,16 +214,11 @@ class GaiaTUI:
         self.running = True
         self.engine = Engine(sample_rate=self.sample_rate) if self.sample_rate else None
         self.is_playing = False
-        self.playback_start_time = 0
         self.playback_duration = 0
         
         # Audio Streaming State
-        self.processed_audio = None
         self.stream = None
         self.play_idx = 0
-        self.needs_reprocessing = False
-        import threading
-        self.process_thread = None
         
         # Mode and File Browser
         self.mode = "EVOLUTION" if self.audio_data is not None else "FILE_PICKER"
@@ -231,23 +243,6 @@ class GaiaTUI:
             self.selected_file_idx = 0
         except Exception as e:
             self.status_msg = f"Error: {e}"
-
-    def reprocess_audio_task(self):
-        if self.audio_data is None: return
-        try:
-            idx = self.selected_mix_idx % len(self.population.mixes)
-            mix = self.population.mixes[idx]
-            new_audio = self.engine.process(self.audio_data, mix)
-            # Safe reassignment
-            self.processed_audio = new_audio
-        except Exception as e:
-            self.status_msg = f"DSP Error: {str(e)}"
-
-    def request_reprocessing(self):
-        import threading
-        if self.process_thread is None or not self.process_thread.is_alive():
-            self.process_thread = threading.Thread(target=self.reprocess_audio_task, daemon=True)
-            self.process_thread.start()
 
     def action_export_track_flow(self):
         """Initiate the export flow."""
@@ -284,37 +279,134 @@ class GaiaTUI:
         self.refresh_file_list()
         self.status_msg = "Arrows: Select Preset | ENTER: Load | ESC: Cancel"
 
+    def action_separate_stems(self):
+        if self.audio_data is None:
+            self.status_msg = "No audio loaded to separate."
+            return
+        if self.is_separating:
+            self.status_msg = "Already separating stems..."
+            return
+            
+        self.is_separating = True
+        self.status_msg = "Separating Stems... (This takes 1-3 minutes)"
+        threading.Thread(target=self._separation_worker, daemon=True).start()
+
+    def _separation_worker(self):
+        def _update_progress(percent: float):
+            self.separation_progress = percent
+            
+        try:
+            self.separation_progress = 0.0
+            cache_key = self.current_filename if self.current_filename else None
+            stems = self.engine.separate_stems(self.audio_data, self.sample_rate, progress_callback=_update_progress, cache_key=cache_key)
+            self.stems_data = stems
+            self.status_msg = f"Separation Complete! Stems cached in STEM-CACHE/{cache_key}" if cache_key else "Separation Complete!"
+            # Trigger mix update to refresh audio buffer
+            if self.is_playing:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.engine.update_mix(self.population.mixes[idx])
+        except Exception as e:
+            self.status_msg = f"Separation Failed: {str(e)}"
+        finally:
+            self.is_separating = False
+            self.separation_progress = 0.0
+
+    def _get_linear_gain(self, stem_name: str) -> float:
+        db_gain = self.stem_gains.get(stem_name, 0.0)
+        return 10 ** (db_gain / 20.0)
+
     def audio_callback(self, outdata, frames, time_info, status):
-        if self.processed_audio is None:
+        if self.audio_data is None:
             outdata.fill(0)
             return
-        
-        # Safe playback looping check
-        if self.play_idx >= self.processed_audio.shape[1]:
-            self.play_idx = 0
 
-        end_idx = min(self.play_idx + frames, self.processed_audio.shape[1])
-        n = end_idx - self.play_idx
-        if n > 0:
-            outdata[:n, :] = self.processed_audio[:, self.play_idx:end_idx].T
-        if n < frames:
-            outdata[n:, :] = 0
-            self.play_idx = 0 # loop playback seamlessly
-        else:
-            self.play_idx += frames
+        # 1. Determine Source length
+        source_len = self.audio_data.shape[1]
+        if self.stems_data is not None:
+            source_len = min([s.shape[1] for s in self.stems_data.values()])
 
+        # Helper to fetch and mix a chunk
+        def fetch_chunk(start_idx, count):
+            if self.stems_data is None:
+                return self.audio_data[:, start_idx:start_idx+count]
+            else:
+                num_channels = self.stems_data["vocals"].shape[0]
+                chunk_sum = np.zeros((num_channels, count))
+                any_solo = any(self.stem_solos.values())
+                
+                for name, stem_audio in self.stems_data.items():
+                    if any_solo and not self.stem_solos[name]: continue
+                    if self.stem_mutes[name] and not self.stem_solos[name]: continue
+                    
+                    gain = self._get_linear_gain(name)
+                    chunk_sum += stem_audio[:, start_idx:start_idx+count] * gain
+                
+                if self.audio_data.shape[0] == 1 and num_channels > 1:
+                    chunk_sum = np.mean(chunk_sum, axis=0, keepdims=True)
+                return chunk_sum
+
+        # 2. Slice current chunk with loop handling
+        try:
+            if self.play_idx + frames <= source_len:
+                raw_chunk = fetch_chunk(self.play_idx, frames)
+                self.play_idx += frames
+            else:
+                # Wrap around logic
+                n1 = max(0, source_len - self.play_idx)
+                n2 = frames - n1
+                
+                raw_chunk = np.zeros((self.audio_data.shape[0], frames))
+                if n1 > 0:
+                    raw_chunk[:, :n1] = fetch_chunk(self.play_idx, n1)
+                
+                # Wrap to beginning
+                self.play_idx = 0
+                if n2 > 0:
+                    fill_size = min(n2, source_len)
+                    raw_chunk[:, n1:n1+fill_size] = fetch_chunk(0, fill_size)
+                    self.play_idx = fill_size
+
+            # 3. Process chunk through active DSP state
+            # Ensure C-contiguity for SciPy/Pedalboard
+            raw_chunk = np.ascontiguousarray(raw_chunk)
+            processed_chunk = self.engine.process_chunk(raw_chunk)
+            
+            # 4. Assign to output
+            outdata[:] = processed_chunk.T
+        except Exception:
+            outdata.fill(0)
     def load_audio(self, filename: str):
         if self.is_playing:
             self.toggle_playback() # stop playback safely
         path = os.path.join(self.current_path, filename)
         try:
             data, sr = sf.read(path)
-            self.audio_data = data.T if data.ndim > 1 else data.reshape(1, -1)
+            self.audio_data = np.ascontiguousarray(data.T if data.ndim > 1 else data.reshape(1, -1))
             self.sample_rate = sr
+            self.current_filename = os.path.basename(filename)
             self.engine = Engine(sample_rate=self.sample_rate)
+            
+            # Auto-load stems if they exist in cache
+            cache_dir = os.path.join("STEM-CACHE", self.current_filename, "htdemucs", "temp_input")
+            if os.path.exists(cache_dir):
+                stem_names = ["vocals", "drums", "bass", "other"]
+                if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
+                    self.stems_data = {}
+                    for s in stem_names:
+                        arr, _ = sf.read(os.path.join(cache_dir, f"{s}.wav"))
+                        self.stems_data[s] = arr.T
+                    self.status_msg = f"Loaded {filename} (with cached stems)"
+                else:
+                    self.stems_data = None
+            else:
+                self.stems_data = None
+
+            # Initial mix compilation
+            if len(self.population.mixes) > 0:
+                self.engine.update_mix(self.population.mixes[0])
+            
             self.mode = "EVOLUTION"
             self.selected_mix_idx = 0 # Reset to prevent IndexError
-            self.processed_audio = self.audio_data.copy()
             self.play_idx = 0
             
             # Update Track Metadata
@@ -323,6 +415,7 @@ class GaiaTUI:
             self.metadata.sample_rate = sr
             self.metadata.channels = self.audio_data.shape[0]
             self.metadata.duration_sec = duration_sec
+            self.playback_duration = duration_sec
             
             self.status_msg = f"Loaded {filename}"
         except Exception as e:
@@ -339,21 +432,20 @@ class GaiaTUI:
             self.status_msg = "Stopped."
         else:
             try:
-                self.status_msg = "Processing..."
-                self.reprocess_audio_task() # Initial synchronous process
-                self.playback_duration = self.processed_audio.shape[1] / self.sample_rate
+                # Compile current mix immediately
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.engine.update_mix(self.population.mixes[idx])
                 
                 # Low-latency settings for Pipewire/Linux
-                # A blocksize of 256 or 512 is standard for real-time response
                 self.stream = sd.OutputStream(
                     samplerate=self.sample_rate, 
-                    channels=self.processed_audio.shape[0], 
+                    channels=self.audio_data.shape[0], 
                     callback=self.audio_callback,
-                    blocksize=512
+                    blocksize=self.blocksize
                 )
                 self.stream.start()
                 self.is_playing = True
-                self.status_msg = "Playing..."
+                self.status_msg = "Playing (Real-time DSP)..."
             except Exception as e:
                 self.status_msg = f"Error: {e}"
 
@@ -507,7 +599,7 @@ class GaiaTUI:
             
         # Refresh engine if playing
         if self.is_playing:
-            self.request_reprocessing()
+            self.engine.update_mix(mix)
 
     def set_value(self, val: float):
         p = self.get_selected_param()
@@ -537,7 +629,7 @@ class GaiaTUI:
             p.current_value = max(p.min_bound, min(p.max_bound, val))
             
         if self.is_playing:
-            self.request_reprocessing()
+            self.engine.update_mix(mix)
 
     def execute_action(self):
         """Executes the primary action (ENTER) based on the current focus."""
@@ -555,7 +647,9 @@ class GaiaTUI:
                     self.status_msg = f"Deleted {removed.name}."
                     self.selected_module_idx = max(0, self.selected_module_idx - 1)
                     self.selected_param_idx = 0
-                    if self.is_playing: self.request_reprocessing()
+                    if self.is_playing:
+                        idx = self.selected_mix_idx % len(self.population.mixes)
+                        self.engine.update_mix(self.population.mixes[idx])
                 except Exception as e:
                     self.status_msg = f"Delete Error: {e}"
             self.confirming_delete = False
@@ -578,7 +672,8 @@ class GaiaTUI:
                             self.selected_param_idx = 0
                             self.mode = "EVOLUTION"
                             self.status_msg = f"Loaded preset: {item['name']}"
-                            if self.is_playing: self.request_reprocessing()
+                            if self.is_playing:
+                                self.engine.update_mix(loaded_mix)
                         except Exception as e:
                             self.status_msg = f"Load Failed: {e}"
                     else:
@@ -613,7 +708,9 @@ class GaiaTUI:
         if self.focus_zone == FocusZone.POPULATION:
             # Evolve selected parent
             self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
-            if self.is_playing: self.request_reprocessing()
+            if self.is_playing:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.engine.update_mix(self.population.mixes[idx])
             return
 
         if self.focus_zone == FocusZone.BANDS:
@@ -628,7 +725,9 @@ class GaiaTUI:
                         new_mod = selected_cls()
                         band.modules.append(new_mod)
                         self.status_msg = f"Added {new_mod.name} to {band.name}"
-                        if self.is_playing: self.request_reprocessing()
+                        if self.is_playing:
+                            idx = self.selected_mix_idx % len(self.population.mixes)
+                            self.engine.update_mix(self.population.mixes[idx])
                 
                 self.selecting_new_fx = False
                 self.selected_module_idx = 0
@@ -733,9 +832,17 @@ class GaiaTUI:
                 return
 
         if key == KEY_TAB and self.mode == "EVOLUTION":
-            zones = [FocusZone.MENU, FocusZone.POPULATION, FocusZone.BANDS, FocusZone.PLAYBACK]
+            zones = [FocusZone.MENU, FocusZone.POPULATION, FocusZone.BANDS, FocusZone.STEMS, FocusZone.PLAYBACK]
             idx = zones.index(self.focus_zone)
-            self.focus_zone = zones[(idx + 1) % len(zones)]
+            
+            # Skip STEMS zone if separating
+            while True:
+                idx = (idx + 1) % len(zones)
+                self.focus_zone = zones[idx]
+                if self.focus_zone == FocusZone.STEMS and self.is_separating:
+                    continue # Skip STEMS if separating
+                break
+                
             self.selecting_new_fx = False # Exit selection mode when switching zones
             self.confirming_delete = False
             return
@@ -808,14 +915,18 @@ class GaiaTUI:
             if isinstance(band, Band):
                 band.is_muted = not band.is_muted
                 self.status_msg = f"Band {band.name} {'Muted' if band.is_muted else 'Unmuted'}"
-                if self.is_playing: self.request_reprocessing()
+                if self.is_playing:
+                    idx = self.selected_mix_idx % len(self.population.mixes)
+                    self.engine.update_mix(self.population.mixes[idx])
         elif key == KEY_S:
             cols = self.get_column_data(1)
             band = cols[self.selected_band_idx]
             if isinstance(band, Band):
                 band.is_soloed = not band.is_soloed
                 self.status_msg = f"Band {band.name} {'Soloed' if band.is_soloed else 'Unsoloed'}"
-                if self.is_playing: self.request_reprocessing()
+                if self.is_playing:
+                    idx = self.selected_mix_idx % len(self.population.mixes)
+                    self.engine.update_mix(self.population.mixes[idx])
         elif key == KEY_K:
             p = self.get_selected_param()
             if p:
@@ -830,6 +941,43 @@ class GaiaTUI:
             self._handle_bands_input(key)
         elif self.focus_zone == FocusZone.PLAYBACK:
             self._handle_playback_input(key)
+        elif self.focus_zone == FocusZone.STEMS:
+            self._handle_stems_input(key)
+
+    def _handle_stems_input(self, key: str):
+        if self.is_separating:
+            self.status_msg = "Cannot adjust stems while separating..."
+            return
+            
+        if not self.stems_data:
+            self.status_msg = "No stems available. Separate stems first."
+            return
+
+        stem_name = self.stem_names[self.selected_stem_idx]
+
+        if key == KEY_LEFT:
+            self.selected_stem_idx = (self.selected_stem_idx - 1) % len(self.stem_names)
+        elif key == KEY_RIGHT:
+            self.selected_stem_idx = (self.selected_stem_idx + 1) % len(self.stem_names)
+        elif key == KEY_M:
+            self.stem_mutes[stem_name] = not self.stem_mutes[stem_name]
+            self.status_msg = f"Stem {stem_name} {'Muted' if self.stem_mutes[stem_name] else 'Unmuted'}"
+        elif key == KEY_S:
+            self.stem_solos[stem_name] = not self.stem_solos[stem_name]
+            self.status_msg = f"Stem {stem_name} {'Soloed' if self.stem_solos[stem_name] else 'Unsoloed'}"
+        elif key in (KEY_UP, KEY_CTRL_UP, KEY_DOWN, KEY_CTRL_DOWN):
+            # Adjust gain for selected stem
+            step = 1.0 if key in (KEY_UP, KEY_DOWN) else 0.1
+            direction = 1 if key in (KEY_UP, KEY_CTRL_UP) else -1
+            
+            new_gain = self.stem_gains[stem_name] + (step * direction)
+            # Clamp between -60dB and +12dB
+            self.stem_gains[stem_name] = max(-60.0, min(12.0, new_gain))
+            
+            # Immediately trigger a mix refresh if playing
+            if self.is_playing:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.engine.update_mix(self.population.mixes[idx])
 
     def _handle_menu_input(self, key: str):
         if not self.header_menu.items: return
@@ -859,18 +1007,20 @@ class GaiaTUI:
                 # Scrub back safely
                 self.play_idx = max(0, self.play_idx - (amount * self.sample_rate))
         elif key in (KEY_RIGHT, KEY_CTRL_RIGHT):
-            if self.sample_rate and self.processed_audio is not None:
+            if self.sample_rate and self.audio_data is not None:
                 amount = 1 if key == KEY_CTRL_RIGHT else 5
                 # Scrub forward safely
-                self.play_idx = min(self.processed_audio.shape[1] - 1, self.play_idx + (amount * self.sample_rate))
+                self.play_idx = min(self.audio_data.shape[1] - 1, self.play_idx + (amount * self.sample_rate))
 
     def _handle_population_input(self, key: str):
         if key == KEY_LEFT:
             self.selected_mix_idx = (self.selected_mix_idx - 1) % len(self.population.mixes)
-            if self.is_playing: self.request_reprocessing()
+            if self.is_playing:
+                self.engine.update_mix(self.population.mixes[self.selected_mix_idx])
         elif key == KEY_RIGHT:
             self.selected_mix_idx = (self.selected_mix_idx + 1) % len(self.population.mixes)
-            if self.is_playing: self.request_reprocessing()
+            if self.is_playing:
+                self.engine.update_mix(self.population.mixes[self.selected_mix_idx])
 
     def _handle_bands_input(self, key: str):
         mix = self.population.mixes[self.selected_mix_idx % len(self.population.mixes)]
@@ -1121,10 +1271,44 @@ class GaiaTUI:
                 prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s (Stopped)"
                 audio_panel = Panel(Text(prog_str, style="dim"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
 
+            # 3.5 Stems Row
+            stems_texts = []
+            if self.is_separating:
+                bars_filled = int((self.separation_progress / 100.0) * 40)
+                bars_empty = 40 - bars_filled
+                p_bar = f"[{'█' * bars_filled}{'░' * bars_empty}]"
+                stems_texts.append(Text(f" Separating Stems... {p_bar} {self.separation_progress:.1f}% ", style="bold black on yellow"))
+            elif not self.stems_data:
+                stems_texts.append(Text(" No Stems (Use File -> Separate Stems) ", style="dim"))
+            else:
+                for i, stem in enumerate(self.stem_names):
+                    is_sel = (self.focus_zone == FocusZone.STEMS and i == self.selected_stem_idx)
+                    gain_str = f"{self.stem_gains[stem]:+.1f}dB"
+                    
+                    # Status flags
+                    flags = []
+                    if self.stem_mutes.get(stem, False): flags.append("M")
+                    if self.stem_solos.get(stem, False): flags.append("S")
+                    flag_str = f"[{''.join(flags)}]" if flags else "   "
+                    
+                    style = "bold white on blue" if is_sel else "cyan"
+                    if self.stem_mutes.get(stem, False) and not self.stem_solos.get(stem, False):
+                        style = "dim red"
+                    elif self.stem_solos.get(stem, False):
+                        style = "bold yellow"
+                        
+                    stems_texts.append(Text(f" {flag_str} {stem.upper()}: {gain_str} ", style=style))
+
+            stems_border_style = "dim"
+            if self.focus_zone == FocusZone.STEMS:
+                stems_border_style = "red" if self.is_separating else "magenta"
+            stems_panel = Panel(Columns(stems_texts, expand=True, align="center"), border_style=stems_border_style, title="Pre-Mix Stems")
+
             # Final Assembly of Evolution mode
             layout.split_column(
                 Layout(header_panel, size=3),
                 Layout(pop_panel, size=3),
+                Layout(stems_panel, size=3),
                 band_layout, # takes remaining ratio=1
                 Layout(audio_panel, size=3),
                 Layout(status_panel, size=3)
@@ -1134,13 +1318,28 @@ class GaiaTUI:
 def main():
     parser = argparse.ArgumentParser(description="GAIA TUI")
     parser.add_argument("input_file", type=str, nargs="?", help="Optional audio file to load on start")
+    parser.add_argument("--blocksize", type=int, default=512, help="Audio buffer block size (default: 512)")
     args = parser.parse_args()
 
     audio_data, sr = None, 44100
     if args.input_file:
         try:
             audio_data, sr = sf.read(args.input_file)
-            audio_data = audio_data.T if audio_data.ndim > 1 else audio_data.reshape(1, -1)
+            audio_data = np.ascontiguousarray(audio_data.T if audio_data.ndim > 1 else audio_data.reshape(1, -1))
+            tui.audio_data = audio_data
+            tui.sample_rate = sr
+            tui.current_filename = os.path.basename(args.input_file)
+            tui.engine = Engine(sample_rate=sr)
+            
+            # Auto-load stems if they exist in cache
+            cache_dir = os.path.join("STEM-CACHE", tui.current_filename, "htdemucs", "temp_input")
+            if os.path.exists(cache_dir):
+                stem_names = ["vocals", "drums", "bass", "other"]
+                if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
+                    tui.stems_data = {}
+                    for s in stem_names:
+                        arr, _ = sf.read(os.path.join(cache_dir, f"{s}.wav"))
+                        tui.stems_data[s] = arr.T
         except Exception as e:
             print(f"Error loading {args.input_file}: {e}")
             sys.exit(1)
@@ -1155,7 +1354,7 @@ def main():
         m.bands[4].modules.append(TransientShaperModule())
 
     pop = Population(initial_mixes)
-    tui = GaiaTUI(pop, audio_data, sr, ".")
+    tui = GaiaTUI(pop, audio_data, sr, ".", blocksize=args.blocksize)
 
     with TerminalMode() as term:
         # Use Rich Live to render the UI. Set auto_refresh=False to avoid background thread issues.
