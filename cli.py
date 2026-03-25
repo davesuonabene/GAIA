@@ -176,6 +176,9 @@ class GaiaTUI:
             MenuItem(title="Stems", children=[
                 MenuItem(title="Separate Stems", action=self.action_separate_stems),
             ]),
+            MenuItem(title="Settings", children=[
+                MenuItem(title="Audio Blocksize", action=self.action_change_blocksize),
+            ]),
         ])
         self.metadata = TrackMetadata()
         self.current_filename = None
@@ -207,6 +210,12 @@ class GaiaTUI:
         self.edit_buffer = ""
         self.input_mode = None # "SAVE_PRESET", "EXPORT_TRACK", or None
         
+        # Export Modal State
+        self.in_export_modal = False
+        self.export_opt_full = True
+        self.export_opt_stems = False
+        self.export_modal_idx = 0
+
         # Sub-menu State
         self.in_submenu = False
         self.selected_child_idx = 0
@@ -251,10 +260,11 @@ class GaiaTUI:
         if self.audio_data is None:
             self.status_msg = "Nothing to export."
             return
-        self.editing = True
-        self.input_mode = "EXPORT_TRACK"
-        self.edit_buffer = ""
-        self.status_msg = "Enter export filename (no ext): █ (ENTER to export, ESC to cancel)"
+        self.in_export_modal = True
+        self.export_modal_idx = 0
+        if self.stems_data is None:
+            self.export_opt_stems = False
+        self.status_msg = "Configure export settings."
 
     def action_swap_track(self):
         """Reset state and go back to File Picker."""
@@ -265,6 +275,20 @@ class GaiaTUI:
         self.mode = "FILE_PICKER"
         self.status_msg = "Pick a new audio track."
         self.refresh_file_list()
+
+    def action_change_blocksize(self):
+        """Cycle through common audio blocksizes."""
+        sizes = [256, 512, 1024, 2048, 4096]
+        try:
+            idx = sizes.index(self.blocksize)
+            self.blocksize = sizes[(idx + 1) % len(sizes)]
+        except ValueError:
+            self.blocksize = 512
+        
+        self.status_msg = f"Blocksize changed to: {self.blocksize}"
+        if self.is_playing:
+            self.toggle_playback()
+            self.toggle_playback()
 
     def action_save_preset_flow(self):
         """Initiate the save preset flow."""
@@ -391,8 +415,8 @@ class GaiaTUI:
                     new_chunk[:min_ch, :] = processed_chunk[:min_ch, :]
                     processed_chunk = new_chunk
 
-            # 5. Assign to output
-            outdata[:] = processed_chunk.T
+            # 5. Assign to output and hard clip to prevent integer wrap/crackle
+            outdata[:] = np.clip(processed_chunk.T, -1.0, 1.0)
         except Exception:
             outdata.fill(0)
     def load_audio(self, filename: str):
@@ -413,8 +437,12 @@ class GaiaTUI:
                 if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
                     self.stems_data = {}
                     for s in stem_names:
-                        arr, _ = sf.read(os.path.join(cache_dir, f"{s}.wav"))
-                        self.stems_data[s] = arr.T
+                        arr, stem_sr = sf.read(os.path.join(cache_dir, f"{s}.wav"))
+                        arr = arr.T
+                        if stem_sr != self.sample_rate:
+                            import librosa
+                            arr = librosa.resample(arr, orig_sr=stem_sr, target_sr=self.sample_rate)
+                        self.stems_data[s] = np.ascontiguousarray(arr)
                     self.status_msg = f"Loaded {filename} (with cached stems)"
                 else:
                     self.stems_data = None
@@ -855,6 +883,35 @@ class GaiaTUI:
             else:
                 return # Block other inputs during confirmation
 
+        if self.in_export_modal:
+            if key == KEY_UP:
+                self.export_modal_idx = (self.export_modal_idx - 1) % 4
+                return
+            elif key == KEY_DOWN:
+                self.export_modal_idx = (self.export_modal_idx + 1) % 4
+                return
+            elif key in (KEY_ENTER, KEY_SPACE):
+                if self.export_modal_idx == 0:
+                    self.export_opt_full = not self.export_opt_full
+                elif self.export_modal_idx == 1:
+                    if self.stems_data is not None:
+                        self.export_opt_stems = not self.export_opt_stems
+                elif self.export_modal_idx == 2:
+                    self.in_export_modal = False
+                    self.editing = True
+                    self.input_mode = "EXPORT_PATH_PROMPT"
+                    self.edit_buffer = ""
+                    self.status_msg = "Enter save path/name (e.g., my_mix): █"
+                elif self.export_modal_idx == 3:
+                    self.in_export_modal = False
+                    self.status_msg = "Export cancelled."
+                return
+            elif key == KEY_ESC:
+                self.in_export_modal = False
+                self.status_msg = "Export cancelled."
+                return
+            return # Block other inputs
+
         if self.editing:
             if key == KEY_ENTER:
                 if self.input_mode == "SAVE_PRESET":
@@ -867,19 +924,60 @@ class GaiaTUI:
                         self.status_msg = f"Saved preset to {filepath}"
                     except Exception as e:
                         self.status_msg = f"Save Failed: {e}"
-                elif self.input_mode == "EXPORT_TRACK":
+                elif self.input_mode == "EXPORT_PATH_PROMPT":
                     try:
                         self.status_msg = "Exporting..."
                         mix_idx = self.selected_mix_idx % len(self.population.mixes)
                         mix = self.population.mixes[mix_idx]
                         
-                        source = self.stems_data if self.stems_data is not None else self.audio_data
-                        exported_audio = self.engine.process(source, mix)
-                        exported_audio = np.clip(exported_audio, -1.0, 1.0)
-                        filename = f"{self.edit_buffer}.wav"
-                        output_path = os.path.join(self.output_dir, filename)
-                        sf.write(output_path, exported_audio.T, self.sample_rate)
-                        self.status_msg = f"Exported to {filename}"
+                        destination = self.edit_buffer
+                        is_full = self.export_opt_full
+                        is_stems = self.export_opt_stems
+                        
+                        export_base_dir = os.path.join(self.output_dir, "output")
+                        os.makedirs(export_base_dir, exist_ok=True)
+                        
+                        if is_full and not is_stems:
+                            source = self.stems_data if self.stems_data is not None else self.audio_data
+                            exported_audio = self.engine.process(source, mix)
+                            exported_audio = np.clip(exported_audio, -1.0, 1.0)
+                            output_path = os.path.join(export_base_dir, f"{destination}.wav")
+                            sf.write(output_path, exported_audio.T, self.sample_rate)
+                            self.status_msg = f"Exported Full Track to {destination}.wav"
+                            
+                        elif is_stems and not is_full:
+                            dest_dir = os.path.join(export_base_dir, destination)
+                            stems_dir = os.path.join(dest_dir, "stems")
+                            os.makedirs(stems_dir, exist_ok=True)
+                            
+                            for stem_name, stem_audio in self.stems_data.items():
+                                stem_path = os.path.join(stems_dir, f"{destination}_{stem_name}.wav")
+                                sf.write(stem_path, stem_audio.T, self.sample_rate)
+                                
+                            self.status_msg = f"Exported Stems to {stems_dir}/"
+                            
+                        elif is_full and is_stems:
+                            dest_dir = os.path.join(export_base_dir, destination)
+                            stems_dir = os.path.join(dest_dir, "stems")
+                            os.makedirs(stems_dir, exist_ok=True)
+                            
+                            # Export Full
+                            source = self.stems_data if self.stems_data is not None else self.audio_data
+                            exported_audio = self.engine.process(source, mix)
+                            exported_audio = np.clip(exported_audio, -1.0, 1.0)
+                            full_path = os.path.join(dest_dir, f"{destination}_full_mix.wav")
+                            sf.write(full_path, exported_audio.T, self.sample_rate)
+                            
+                            # Export Stems
+                            if self.stems_data is not None:
+                                for stem_name, stem_audio in self.stems_data.items():
+                                    stem_path = os.path.join(stems_dir, f"{destination}_{stem_name}.wav")
+                                    sf.write(stem_path, stem_audio.T, self.sample_rate)
+                                
+                            self.status_msg = f"Exported Full Track & Stems to {dest_dir}/"
+                            
+                        else:
+                            self.status_msg = "Nothing selected for export."
                     except Exception as e:
                         self.status_msg = f"Export Failed: {e}"
                 else:
@@ -1295,8 +1393,50 @@ class GaiaTUI:
         meta = self.metadata
         bpm_str = f"{meta.bpm} BPM" if meta.bpm else "No BPM"
         meta_str = f"File: {meta.filename or 'None'} | {meta.sample_rate}Hz | {meta.channels}ch | {bpm_str}"
-        footer_text = f"{self.status_msg}  |  {meta_str}"
+        
+        display_msg = self.status_msg
+        if self.editing and "█" in self.status_msg:
+            display_msg = self.status_msg.replace("█", self.edit_buffer + "█")
+            
+        footer_text = f"{display_msg}  |  {meta_str}"
         status_panel = Panel(Text(footer_text, style="bold yellow" if self.editing else "italic green"), box=box.SIMPLE)
+
+        if self.in_export_modal:
+            lines = []
+            
+            style0 = "bold black on white" if self.export_modal_idx == 0 else "white"
+            mark0 = "[X]" if self.export_opt_full else "[ ]"
+            lines.append(Text(f" {mark0} Full Track ", style=style0))
+            
+            style1 = "bold black on white" if self.export_modal_idx == 1 else "white"
+            mark1 = "[X]" if self.export_opt_stems else "[ ]"
+            if self.stems_data is None:
+                style1 = "dim" if self.export_modal_idx != 1 else "bold black on grey50"
+                lines.append(Text(f" [ ] Stems (Unavailable) ", style=style1))
+            else:
+                lines.append(Text(f" {mark1} Stems (Vocals, Drums, Bass, Other) ", style=style1))
+                
+            style2 = "bold black on white" if self.export_modal_idx == 2 else "green"
+            lines.append(Text(" [ Continue ] ", style=style2))
+            
+            style3 = "bold black on white" if self.export_modal_idx == 3 else "red"
+            lines.append(Text(" [ Cancel ] ", style=style3))
+            
+            modal_content = Group(*[Align.center(line) for line in lines])
+            modal_panel = Panel(
+                modal_content,
+                title="Export Settings",
+                border_style="magenta",
+                box=box.DOUBLE,
+                padding=(1, 4)
+            )
+            
+            layout.split_column(
+                Layout(header_panel, size=3),
+                Layout(Align.center(modal_panel, vertical="middle"), ratio=1),
+                Layout(status_panel, size=3)
+            )
+            return layout
 
         if self.mode == "FILE_PICKER":
             # File Browser Layout
@@ -1496,8 +1636,12 @@ def main():
                 if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
                     tui.stems_data = {}
                     for s in stem_names:
-                        arr, _ = sf.read(os.path.join(cache_dir, f"{s}.wav"))
-                        tui.stems_data[s] = arr.T
+                        arr, stem_sr = sf.read(os.path.join(cache_dir, f"{s}.wav"))
+                        arr = arr.T
+                        if stem_sr != sr:
+                            import librosa
+                            arr = librosa.resample(arr, orig_sr=stem_sr, target_sr=sr)
+                        tui.stems_data[s] = np.ascontiguousarray(arr)
         except Exception as e:
             print(f"Error loading {args.input_file}: {e}")
             sys.exit(1)

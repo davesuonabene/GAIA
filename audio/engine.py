@@ -210,8 +210,12 @@ class Engine:
                     stems = {}
                     for stem in stem_names:
                         stem_path = os.path.join(output_folder, f"{stem}.wav")
-                        stem_arr, _ = sf.read(stem_path)
-                        stems[stem] = np.ascontiguousarray(stem_arr.T)
+                        stem_arr, stem_sr = sf.read(stem_path)
+                        stem_arr = stem_arr.T
+                        if stem_sr != sample_rate:
+                            import librosa
+                            stem_arr = librosa.resample(stem_arr, orig_sr=stem_sr, target_sr=sample_rate)
+                        stems[stem] = np.ascontiguousarray(stem_arr)
                     
                     # Instantly set progress to 100% since it's cached
                     if progress_callback:
@@ -284,8 +288,12 @@ class Engine:
                     raise Exception(f"Demucs output missing for {stem}: {stem_path}")
                 
                 # sf.read returns (samples, channels), we need (channels, samples)
-                stem_arr, _ = sf.read(stem_path)
-                stems[stem] = np.ascontiguousarray(stem_arr.T)
+                stem_arr, stem_sr = sf.read(stem_path)
+                stem_arr = stem_arr.T
+                if stem_sr != sample_rate:
+                    import librosa
+                    stem_arr = librosa.resample(stem_arr, orig_sr=stem_sr, target_sr=sample_rate)
+                stems[stem] = np.ascontiguousarray(stem_arr)
 
             return stems
         finally:
