@@ -5,6 +5,7 @@ import time
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
+import librosa
 import threading
 from typing import List, Any, Callable, Optional
 from enum import Enum, auto
@@ -88,6 +89,7 @@ KEY_M = "M"
 KEY_S = "S"
 KEY_K = "K"
 KEY_D = "D"
+KEY_B = "B"
 KEY_BRACKET_LEFT = "["
 KEY_BRACKET_RIGHT = "]"
 
@@ -229,6 +231,7 @@ class GaiaTUI:
         
         # Audio Streaming State
         self.stream = None
+        self.preview_stream = None
         self.play_idx = 0
         
         # Mode and File Browser
@@ -337,6 +340,50 @@ class GaiaTUI:
             self.is_separating = False
             self.separation_progress = 0.0
 
+    def _preview_selected_file(self):
+        """Starts a background playback of the selected file for preview."""
+        if self.preview_stream:
+            try:
+                self.preview_stream.stop()
+            except Exception:
+                pass
+            self.preview_stream = None
+            sd.stop()
+
+        if self.selected_file_idx >= len(self.file_list):
+            return
+
+        item = self.file_list[self.selected_file_idx]
+        if item["type"] == "dir":
+            return
+
+        exts = (".wav", ".flac", ".mp3", ".aiff", ".ogg")
+        if not any(item["name"].lower().endswith(e) for e in exts):
+            return
+
+        class PreviewHandle:
+            def stop(self):
+                sd.stop()
+
+        def _play_thread():
+            try:
+                path = os.path.join(self.current_path, item["name"])
+                data, sr = sf.read(path)
+                # Keep a short preview, say 5 seconds
+                preview_len = int(sr * 5)
+                # Ensure data is (samples, channels) for sd.play
+                if data.ndim == 1:
+                    data = data[:preview_len]
+                else:
+                    data = data[:preview_len, :]
+                
+                sd.play(data, sr)
+                self.preview_stream = PreviewHandle()
+            except Exception:
+                pass
+
+        threading.Thread(target=_play_thread, daemon=True).start()
+
     def audio_callback(self, outdata, frames, time_info, status):
         if self.audio_data is None:
             outdata.fill(0)
@@ -415,6 +462,10 @@ class GaiaTUI:
                     new_chunk[:min_ch, :] = processed_chunk[:min_ch, :]
                     processed_chunk = new_chunk
 
+            # 4.5 Apply invisible -1dB (-10.8% amplitude) output scaling to give stream headroom and prevent pipeline clipping
+            headroom_multiplier = 10 ** (-1.0 / 20.0)
+            processed_chunk = processed_chunk * headroom_multiplier
+
             # 5. Assign to output and hard clip to prevent integer wrap/crackle
             outdata[:] = np.clip(processed_chunk.T, -1.0, 1.0)
         except Exception:
@@ -431,7 +482,7 @@ class GaiaTUI:
             self.engine = Engine(sample_rate=self.sample_rate)
             
             # Auto-load stems if they exist in cache
-            cache_dir = os.path.join("STEM-CACHE", self.current_filename, "htdemucs", "temp_input")
+            cache_dir = os.path.join("STEM-CACHE", self.current_filename, "htdemucs", os.path.splitext(self.current_filename)[0])
             if os.path.exists(cache_dir):
                 stem_names = ["vocals", "drums", "bass", "other"]
                 if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
@@ -439,11 +490,21 @@ class GaiaTUI:
                     for s in stem_names:
                         arr, stem_sr = sf.read(os.path.join(cache_dir, f"{s}.wav"))
                         arr = arr.T
-                        if stem_sr != self.sample_rate:
-                            import librosa
+
+                        if int(stem_sr) != int(self.sample_rate):
                             arr = librosa.resample(arr, orig_sr=stem_sr, target_sr=self.sample_rate)
+
+                        # Ensure exact length match
+                        target_len = self.audio_data.shape[1]
+                        if arr.shape[1] > target_len:
+                            arr = arr[:, :target_len]
+                        elif arr.shape[1] < target_len:
+                            pad = np.zeros((arr.shape[0], target_len - arr.shape[1]), dtype=arr.dtype)
+                            arr = np.concatenate([arr, pad], axis=1)
+
                         self.stems_data[s] = np.ascontiguousarray(arr)
-                    self.status_msg = f"Loaded {filename} (with cached stems)"
+                    self.status_msg = f"Loaded {filename} (with cached stems resampled to {self.sample_rate}Hz)"
+
                 else:
                     self.stems_data = None
             else:
@@ -746,6 +807,9 @@ class GaiaTUI:
         if self.mode == "FILE_PICKER":
             # ... existing file picker logic ...
             if self.file_list:
+                if self.preview_stream:
+                    self.preview_stream.stop()
+                
                 item = self.file_list[self.selected_file_idx]
                 if item["type"] == "dir":
                     self.current_path = os.path.abspath(os.path.join(self.current_path, item["name"]))
@@ -797,9 +861,13 @@ class GaiaTUI:
 
         if self.focus_zone == FocusZone.POPULATION:
             # Evolve selected parent
+            idx = self.selected_mix_idx % len(self.population.mixes)
+            if self.population.mixes[idx].is_locked:
+                self.status_msg = "Cannot evolve a locked mix. Unlock it first (Press K)."
+                return
+                
             self.population.generate_next_generation(self.selected_mix_idx, 0.5, 0.5)
             if self.is_playing:
-                idx = self.selected_mix_idx % len(self.population.mixes)
                 self.engine.update_mix(self.population.mixes[idx])
             return
 
@@ -1041,7 +1109,14 @@ class GaiaTUI:
         # Mix Sorting logic (Depth 0 = FocusZone.POPULATION)
         # ... (mix sorting logic unchanged)
         if self.focus_zone == FocusZone.POPULATION:
-            if key == KEY_SHIFT_UP:
+            if key == KEY_K:
+                idx = self.selected_mix_idx % len(self.population.mixes)
+                self.population.mixes[idx].is_locked = not self.population.mixes[idx].is_locked
+                status = "Locked" if self.population.mixes[idx].is_locked else "Unlocked"
+                self.status_msg = f"Mix {idx} {status}."
+                # Allow fallthrough to _handle_population_input if we just locked, but we shouldn't return here if we want left/right to keep working.
+                # Actually, locking shouldn't break navigation unless we return early. Let's just not return here!
+            elif key == KEY_SHIFT_UP:
                 idx = self.selected_mix_idx % len(self.population.mixes)
                 prev_idx = (idx - 1) % len(self.population.mixes)
                 self.population.mixes[idx], self.population.mixes[prev_idx] = self.population.mixes[prev_idx], self.population.mixes[idx]
@@ -1059,12 +1134,18 @@ class GaiaTUI:
             # ... (file picker logic unchanged)
             if key == KEY_UP:
                 self.selected_file_idx = (self.selected_file_idx - 1) % max(1, len(self.file_list))
+                self._preview_selected_file()
             elif key == KEY_DOWN:
                 self.selected_file_idx = (self.selected_file_idx + 1) % max(1, len(self.file_list))
+                self._preview_selected_file()
             elif key == KEY_BACKSPACE:
+                if self.preview_stream:
+                    self.preview_stream.stop()
                 self.current_path = os.path.abspath(os.path.join(self.current_path, ".."))
                 self.refresh_file_list()
             elif key == KEY_ESC:
+                if self.preview_stream:
+                    self.preview_stream.stop()
                 if self.audio_data is not None:
                     self.mode = "EVOLUTION"
                     self.status_msg = "Evolution Mode."
@@ -1112,10 +1193,11 @@ class GaiaTUI:
                     idx = self.selected_mix_idx % len(self.population.mixes)
                     self.engine.update_mix(self.population.mixes[idx])
         elif key == KEY_K:
-            p = self.get_selected_param()
-            if p:
-                p.is_locked = not p.is_locked
-                self.status_msg = f"Param {p.name} {'Locked' if p.is_locked else 'Unlocked'}"
+            if self.focus_zone != FocusZone.POPULATION:
+                p = self.get_selected_param()
+                if p:
+                    p.is_locked = not p.is_locked
+                    self.status_msg = f"Param {p.name} {'Locked' if p.is_locked else 'Unlocked'}"
 
         if self.focus_zone == FocusZone.MENU:
             self._handle_menu_input(key)
@@ -1213,6 +1295,11 @@ class GaiaTUI:
             self.adjust_value(-1)
         elif key == KEY_RIGHT:
             self.adjust_value(1)
+        elif key == KEY_B:
+            current_col.is_bypassed = not current_col.is_bypassed
+            self.status_msg = f"{current_col.name} {'Bypassed' if current_col.is_bypassed else 'Active'}"
+            if self.is_playing:
+                self.engine.update_mix(self.population.mixes[self.selected_mix_idx % len(self.population.mixes)])
         elif key == KEY_SHIFT_UP: # Granular up
             self.adjust_value(1, granular=True)
         elif key == KEY_SHIFT_DOWN: # Granular down
@@ -1250,6 +1337,21 @@ class GaiaTUI:
                 amount = 1 if key == KEY_CTRL_RIGHT else 5
                 # Scrub forward safely
                 self.play_idx = min(self.audio_data.shape[1] - 1, self.play_idx + (amount * self.sample_rate))
+        elif key == KEY_B:
+            # Toggle global bypass for the current mix
+            mix = self.population.mixes[self.selected_mix_idx % len(self.population.mixes)]
+            all_bands = [mix.pre_band, mix.post_band] + mix.bands
+            if mix.stem_bands:
+                all_bands += list(mix.stem_bands.values())
+            
+            # If any band is NOT bypassed, bypass all. Otherwise un-bypass all.
+            target_state = not all(b.is_bypassed for b in all_bands)
+            for b in all_bands:
+                b.is_bypassed = target_state
+            
+            self.status_msg = f"All bands {'Bypassed' if target_state else 'Active'}"
+            if self.is_playing:
+                self.engine.update_mix(mix)
 
     def _handle_population_input(self, key: str):
         if key == KEY_LEFT:
@@ -1361,6 +1463,11 @@ class GaiaTUI:
             self.adjust_value(-1)
         elif key == KEY_RIGHT:
             self.adjust_value(1)
+        elif key == KEY_B:
+            current_col.is_bypassed = not current_col.is_bypassed
+            self.status_msg = f"{current_col.name} {'Bypassed' if current_col.is_bypassed else 'Active'}"
+            if self.is_playing:
+                self.engine.update_mix(mix)
         elif key == KEY_CTRL_LEFT: # Redundant but safe
             self.adjust_value(-1, granular=True)
         elif key == KEY_CTRL_RIGHT: # Redundant but safe
@@ -1392,7 +1499,7 @@ class GaiaTUI:
         # Footer / Status Panel
         meta = self.metadata
         bpm_str = f"{meta.bpm} BPM" if meta.bpm else "No BPM"
-        meta_str = f"File: {meta.filename or 'None'} | {meta.sample_rate}Hz | {meta.channels}ch | {bpm_str}"
+        meta_str = f"File: {meta.filename or 'None'} | {meta.sample_rate}Hz | {meta.channels}ch | Block: {self.blocksize} | {bpm_str}"
         
         display_msg = self.status_msg
         if self.editing and "█" in self.status_msg:
@@ -1474,8 +1581,9 @@ class GaiaTUI:
             for i in range(len(self.population.mixes)):
                 is_sel = (self.focus_zone == FocusZone.POPULATION and i == self.selected_mix_idx)
                 prefix = "▶ " if is_sel else "  "
+                lock_indicator = " [*]" if self.population.mixes[i].is_locked else ""
                 style = "bold white on blue" if is_sel else "white" if i == self.selected_mix_idx else "dim"
-                mix_texts.append(Text(f"{prefix}Mix {i}", style=style))
+                mix_texts.append(Text(f"{prefix}Mix {i}{lock_indicator}", style=style))
                 
             pop_panel = Panel(Columns(mix_texts, expand=True, align="center"), border_style="magenta" if (self.focus_zone == FocusZone.POPULATION) else "dim")
 
@@ -1494,10 +1602,11 @@ class GaiaTUI:
                 # Rendering a Band (PRE, POST, or Frequency Band)
                 items = []
                 
-                # Mute / Solo indicators
+                # Mute / Solo / Bypass indicators
                 ms_text = Text("")
                 if band.is_soloed: ms_text.append("[S]", style="bold black on yellow")
                 if band.is_muted: ms_text.append("[M]", style="bold white on red")
+                if getattr(band, 'is_bypassed', False): ms_text.append("[B]", style="bold white on blue")
                 if len(ms_text) > 0: items.append(ms_text)
 
                 # Band Title & Crossover logic
@@ -1539,19 +1648,27 @@ class GaiaTUI:
                 band_layout[f"col_{i}"].update(band_panel)
 
             # 3. Audio Progress Row
+            idx = self.selected_mix_idx % len(self.population.mixes)
+            mix = self.population.mixes[idx]
+
+            # Check if all relevant bands are bypassed
+            all_b = [mix.pre_band, mix.post_band] + mix.bands
+            if mix.stem_bands: all_b += list(mix.stem_bands.values())
+            is_global_bypass = all(getattr(b, 'is_bypassed', False) for b in all_b)
+            bypass_str = " (BYPASSED)" if is_global_bypass else ""
+
             elapsed = self.play_idx / self.sample_rate if self.sample_rate else 0
             pct = (elapsed / self.playback_duration) if self.playback_duration > 0 else 0
             bars_filled = int(pct * 20)
             bars_empty = 20 - bars_filled
             progress_bar = f"[{'█' * bars_filled}{'░' * bars_empty}]"
-            
-            if self.is_playing:
-                prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s"
-                audio_panel = Panel(Text(prog_str, style="bold cyan"), title="Audio", border_style="green" if self.focus_zone == FocusZone.PLAYBACK else "dim")
-            else:
-                prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s (Stopped)"
-                audio_panel = Panel(Text(prog_str, style="dim"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
 
+            if self.is_playing:
+                prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s{bypass_str}"
+                audio_panel = Panel(Text(prog_str, style="bold cyan" if not is_global_bypass else "bold white on blue"), title="Audio", border_style="green" if self.focus_zone == FocusZone.PLAYBACK else "dim")
+            else:
+                prog_str = f"{progress_bar} {elapsed:.1f}s / {self.playback_duration:.1f}s (Stopped){bypass_str}"
+                audio_panel = Panel(Text(prog_str, style="dim" if not is_global_bypass else "bold white on blue"), title="Audio", border_style="cyan" if self.focus_zone == FocusZone.PLAYBACK else "dim")
             # 3.5 Stems Row (Miller Columns)
             stems_layout = Layout(name="stems")
             if self.is_separating:
@@ -1573,18 +1690,19 @@ class GaiaTUI:
                     band = mix.stem_bands[stem_name]
                     items = []
                     
-                    # Mute / Solo indicators
+                    # Mute / Solo / Bypass indicators
                     ms_text = Text("")
                     if band.is_soloed: ms_text.append("[S]", style="bold black on yellow")
                     if band.is_muted: ms_text.append("[M]", style="bold white on red")
+                    if getattr(band, 'is_bypassed', False): ms_text.append("[B]", style="bold white on blue")
                     if len(ms_text) > 0: items.append(ms_text)
 
-                    # Subtitle: Gain
+                    # Title: Name and Gain
                     is_gain_sel = is_col_focused and self.stem_mod_idx == -1
                     gain_val = self.edit_buffer if (is_gain_sel and self.editing) else f"{band.gain.current_value:.1f}"
                     if band.gain.is_locked: gain_val = f"*{gain_val}"
                     gain_style = "bold black on yellow" if (is_gain_sel and self.editing) else "bold white on blue" if is_gain_sel else "white"
-                    stem_subtitle = Text(f" {stem_name.upper()} | {gain_val}dB ", style=gain_style)
+                    stem_title = Text(f" {stem_name.upper()} | {gain_val}dB ", style=gain_style)
 
                     # Modules
                     if is_col_focused:
@@ -1596,8 +1714,8 @@ class GaiaTUI:
                     
                     stem_panel = Panel(
                         Group(*items), 
-                        subtitle=stem_subtitle,
-                        subtitle_align="center",
+                        title=stem_title,
+                        title_align="center",
                         border_style="blue" if is_col_focused else "dim"
                     )
                     stems_layout[f"stem_col_{i}"].update(stem_panel)
@@ -1630,7 +1748,7 @@ def main():
             tui.engine = Engine(sample_rate=sr)
             
             # Auto-load stems if they exist in cache
-            cache_dir = os.path.join("STEM-CACHE", tui.current_filename, "htdemucs", "temp_input")
+            cache_dir = os.path.join("STEM-CACHE", tui.current_filename, "htdemucs", os.path.splitext(tui.current_filename)[0])
             if os.path.exists(cache_dir):
                 stem_names = ["vocals", "drums", "bass", "other"]
                 if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
@@ -1638,9 +1756,18 @@ def main():
                     for s in stem_names:
                         arr, stem_sr = sf.read(os.path.join(cache_dir, f"{s}.wav"))
                         arr = arr.T
-                        if stem_sr != sr:
-                            import librosa
-                            arr = librosa.resample(arr, orig_sr=stem_sr, target_sr=sr)
+
+                        if int(stem_sr) != int(tui.sample_rate):
+                            arr = librosa.resample(arr, orig_sr=stem_sr, target_sr=tui.sample_rate)
+
+                        # Ensure exact length match
+                        target_len = tui.audio_data.shape[1]
+                        if arr.shape[1] > target_len:
+                            arr = arr[:, :target_len]
+                        elif arr.shape[1] < target_len:
+                            pad = np.zeros((arr.shape[0], target_len - arr.shape[1]), dtype=arr.dtype)
+                            arr = np.concatenate([arr, pad], axis=1)
+
                         tui.stems_data[s] = np.ascontiguousarray(arr)
         except Exception as e:
             print(f"Error loading {args.input_file}: {e}")
@@ -1648,12 +1775,9 @@ def main():
 
     # Initialize a dummy population
     initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0, 8000.0]) for _ in range(5)]
-    for m in initial_mixes:
-        m.bands[0].modules.append(CompressorModule())
-        m.bands[1].modules.append(SaturationModule())
-        m.bands[2].modules.append(ExpanderModule())
-        m.bands[3].modules.append(CompressorModule())
-        m.bands[4].modules.append(TransientShaperModule())
+    
+    # Lock the first mix by default so user has a safe workspace
+    initial_mixes[0].is_locked = True
 
     pop = Population(initial_mixes)
     tui = GaiaTUI(pop, audio_data, sr, ".", blocksize=args.blocksize)

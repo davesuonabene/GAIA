@@ -41,6 +41,8 @@ class Mix:
         for i in range(num_bands):
             name = band_names[i] if i < len(band_names) else f"Band {i+1}"
             self.bands.append(Band(name))
+            
+        self.is_locked = False
 
     def to_dict(self) -> dict:
         """Serialize mix to a dictionary."""
@@ -49,7 +51,8 @@ class Mix:
             "crossover_params": [p.to_dict() for p in self.crossover_params],
             "pre_band": self.pre_band.to_dict(),
             "bands": [b.to_dict() for b in self.bands],
-            "post_band": self.post_band.to_dict()
+            "post_band": self.post_band.to_dict(),
+            "is_locked": self.is_locked
         }
 
     @classmethod
@@ -72,6 +75,8 @@ class Mix:
             
         if "post_band" in data:
             instance.post_band = Band.from_dict(data["post_band"])
+            
+        instance.is_locked = data.get("is_locked", False)
             
         return instance
 

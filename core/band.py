@@ -23,6 +23,7 @@ class Band:
         self.modules: List[AudioModule] = []
         self.is_muted = False
         self.is_soloed = False
+        self.is_bypassed = False
         self.gain = Parameter("Gain", 0.0, -24.0, 24.0, 10.0)
 
     def to_dict(self) -> dict:
@@ -31,6 +32,7 @@ class Band:
             "name": self.name,
             "is_muted": self.is_muted,
             "is_soloed": self.is_soloed,
+            "is_bypassed": self.is_bypassed,
             "gain": self.gain.to_dict(),
             "modules": [m.to_dict() for m in self.modules]
         }
@@ -41,6 +43,7 @@ class Band:
         instance = cls(data["name"])
         instance.is_muted = data.get("is_muted", False)
         instance.is_soloed = data.get("is_soloed", False)
+        instance.is_bypassed = data.get("is_bypassed", False)
         if "gain" in data:
             instance.gain = Parameter.from_dict(data["gain"])
         
@@ -91,6 +94,7 @@ class Band:
         state = ""
         if self.is_soloed: state += "[S]"
         if self.is_muted: state += "[M]"
+        if self.is_bypassed: state += "[B]"
         
         module_chain = " -> ".join([m.name for m in self.modules]) if self.modules else "Empty"
         return f"Band: {self.name} {state} | Gain: {self.gain.current_value:.1f}dB | Chain: {module_chain}"

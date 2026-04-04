@@ -5,7 +5,8 @@ from typing import List
 class Crossover:
     """
     Splits an audio signal into multiple bands.
-    Uses stateful IIR filters for real-time chunk processing.
+    Uses stateful Linkwitz-Riley (LR8) IIR filters for real-time chunk processing.
+    LR8 sums perfectly flat without phase cancellation issues.
     """
     def __init__(self, crossovers: List[float], fs: int = 44100):
         self.crossovers = sorted(crossovers)
@@ -17,20 +18,18 @@ class Crossover:
         """Initializes/Resets the filter states for each band split."""
         self.filters = []
         for cutoff in self.crossovers:
-            # We use a 4th order Linkwitz-Riley (cascaded 2nd order Butterworth)
-            # LR-4 has a flat summed frequency response.
-            sos = signal.butter(2, cutoff, 'lowpass', fs=self.fs, output='sos')
-            # Each split needs its own state (zi)
-            # Since it's LR-4 (two passes), we need two states if we were doing it manually,
-            # but we can just use a 4th order Butterworth SOS if we want LR-4 behavior? 
-            # Actually LR-4 is (Butterworth-2)^2.
+            # We cascade two 4th order Butterworth filters to create an 8th order Linkwitz-Riley.
+            # LR8 ensures flat magnitude sum and in-phase alignment.
+            sos_lp = signal.butter(4, cutoff, 'lowpass', fs=self.fs, output='sos')
+            sos_hp = signal.butter(4, cutoff, 'highpass', fs=self.fs, output='sos')
             
-            # For simplicity and perfect reconstruction in real-time without complex phase alignment:
-            # We'll use the subtractive approach but with stateful sosfilt.
             self.filters.append({
-                'sos': sos,
-                'zi1': None, # State for first pass
-                'zi2': None  # State for second pass
+                'sos_lp': sos_lp,
+                'sos_hp': sos_hp,
+                'zi_lp1': None,
+                'zi_lp2': None,
+                'zi_hp1': None,
+                'zi_hp2': None
             })
 
     def update_crossovers(self, crossovers: List[float]):
@@ -42,31 +41,37 @@ class Crossover:
     def split_chunk(self, chunk: np.ndarray) -> List[np.ndarray]:
         """
         Splits a chunk of audio into N bands using stateful filters.
-        Guarantees perfect reconstruction when summed due to subtractive architecture.
         """
         bands = []
         remainder = chunk
 
         for f in self.filters:
-            # First pass
-            if f['zi1'] is None:
-                # Initialize state with zeros. shape of zi is (n_sections, channels, 2)
-                f['zi1'] = np.zeros((f['sos'].shape[0], 2))
-                if chunk.ndim > 1: # Stereo or Multi-channel
-                    f['zi1'] = np.zeros((f['sos'].shape[0], chunk.shape[0], 2))
-
-            lp_pass1, f['zi1'] = signal.sosfilt(f['sos'], remainder, zi=f['zi1'], axis=-1)
-
-            # Second pass (to make it 4th order / LR-4 equivalent)
-            if f['zi2'] is None:
-                f['zi2'] = np.zeros((f['sos'].shape[0], 2))
+            # Lowpass path (Band N)
+            if f['zi_lp1'] is None:
+                n_sections_lp = f['sos_lp'].shape[0]
                 if chunk.ndim > 1:
-                    f['zi2'] = np.zeros((f['sos'].shape[0], chunk.shape[0], 2))
+                    f['zi_lp1'] = np.zeros((n_sections_lp, chunk.shape[0], 2))
+                    f['zi_lp2'] = np.zeros((n_sections_lp, chunk.shape[0], 2))
+                else:
+                    f['zi_lp1'] = np.zeros((n_sections_lp, 2))
+                    f['zi_lp2'] = np.zeros((n_sections_lp, 2))
 
-            lp_signal, f['zi2'] = signal.sosfilt(f['sos'], lp_pass1, zi=f['zi2'], axis=-1)            
-            # Subtractive High Pass
-            hp_signal = remainder - lp_signal
-            
+            lp_pass1, f['zi_lp1'] = signal.sosfilt(f['sos_lp'], remainder, zi=f['zi_lp1'], axis=-1)
+            lp_signal, f['zi_lp2'] = signal.sosfilt(f['sos_lp'], lp_pass1, zi=f['zi_lp2'], axis=-1)
+
+            # Highpass path (Remainder for next bands)
+            if f['zi_hp1'] is None:
+                n_sections_hp = f['sos_hp'].shape[0]
+                if chunk.ndim > 1:
+                    f['zi_hp1'] = np.zeros((n_sections_hp, chunk.shape[0], 2))
+                    f['zi_hp2'] = np.zeros((n_sections_hp, chunk.shape[0], 2))
+                else:
+                    f['zi_hp1'] = np.zeros((n_sections_hp, 2))
+                    f['zi_hp2'] = np.zeros((n_sections_hp, 2))
+
+            hp_pass1, f['zi_hp1'] = signal.sosfilt(f['sos_hp'], remainder, zi=f['zi_hp1'], axis=-1)
+            hp_signal, f['zi_hp2'] = signal.sosfilt(f['sos_hp'], hp_pass1, zi=f['zi_hp2'], axis=-1)
+
             bands.append(lp_signal)
             remainder = hp_signal
             
