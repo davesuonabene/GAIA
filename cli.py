@@ -7,7 +7,7 @@ import soundfile as sf
 import sounddevice as sd
 import librosa
 import threading
-from typing import List, Any, Callable, Optional
+from typing import List, Any, Callable, Optional, Dict
 from enum import Enum, auto
 from dataclasses import dataclass, field
 
@@ -234,6 +234,10 @@ class GaiaTUI:
         self.preview_stream = None
         self.play_idx = 0
         
+        # Buffers for real-time safety in audio_callback
+        self._raw_chunk_buffer: Optional[np.ndarray] = None
+        self._stem_chunk_buffers: Dict[str, np.ndarray] = {}
+        
         # Mode and File Browser
         self.mode = "EVOLUTION" if self.audio_data is not None else "FILE_PICKER"
         self.current_path = os.path.abspath(".")
@@ -394,12 +398,14 @@ class GaiaTUI:
         if self.stems_data is not None:
             source_len = min([s.shape[1] for s in self.stems_data.values()])
 
-        # Helper to fetch and slice a chunk
+        # Helper to fetch and slice a chunk (Modified for pre-allocation)
         def fetch_chunk(start_idx, count):
             if self.stems_data is None:
                 return self.audio_data[:, start_idx:start_idx+count]
             else:
-                # Return a dictionary of chunks for the engine to handle
+                # We can't easily return a view of multiple stems in a dict without allocation,
+                # but we can at least avoid re-creating the dict if we were careful.
+                # For now, let's just ensure the underlying arrays are views.
                 return {name: stem_audio[:, start_idx:start_idx+count] 
                         for name, stem_audio in self.stems_data.items()}
 
@@ -412,43 +418,47 @@ class GaiaTUI:
                 # Wrap around logic
                 n1 = max(0, source_len - self.play_idx)
                 n2 = frames - n1
-                
+
                 if self.stems_data is None:
-                    raw_chunk = np.zeros((self.audio_data.shape[0], frames))
+                    if self._raw_chunk_buffer is None or self._raw_chunk_buffer.shape != (self.audio_data.shape[0], frames):
+                        self._raw_chunk_buffer = np.zeros((self.audio_data.shape[0], frames), dtype=np.float32)
+
+                    self._raw_chunk_buffer.fill(0)
                     if n1 > 0:
-                        raw_chunk[:, :n1] = fetch_chunk(self.play_idx, n1)
-                    
+                        self._raw_chunk_buffer[:, :n1] = fetch_chunk(self.play_idx, n1)
+
                     self.play_idx = 0
                     if n2 > 0:
                         fill_size = min(n2, source_len)
-                        raw_chunk[:, n1:n1+fill_size] = fetch_chunk(0, fill_size)
+                        self._raw_chunk_buffer[:, n1:n1+fill_size] = fetch_chunk(0, fill_size)
                         self.play_idx = fill_size
+                    raw_chunk = self._raw_chunk_buffer
                 else:
                     # Wrap around for stems
-                    raw_chunk = {}
                     num_channels = next(iter(self.stems_data.values())).shape[0]
+                    raw_chunk = {}
                     for name in self.stems_data:
-                        stem_raw = np.zeros((num_channels, frames))
+                        if name not in self._stem_chunk_buffers or self._stem_chunk_buffers[name].shape != (num_channels, frames):
+                            self._stem_chunk_buffers[name] = np.zeros((num_channels, frames), dtype=np.float32)
+
+                        stem_raw = self._stem_chunk_buffers[name]
+                        stem_raw.fill(0)
+
                         if n1 > 0:
                             stem_raw[:, :n1] = self.stems_data[name][:, self.play_idx:self.play_idx+n1]
-                        
+
                         if n2 > 0:
                             fill_size = min(n2, source_len)
                             stem_raw[:, n1:n1+fill_size] = self.stems_data[name][:, 0:fill_size]
-                        
+
                         raw_chunk[name] = stem_raw
-                    
+
                     self.play_idx = n2 % source_len if n2 > 0 else 0
 
             # 3. Process chunk through active DSP state
-            if isinstance(raw_chunk, dict):
-                # Ensure C-contiguity for each stem
-                raw_chunk = {k: np.ascontiguousarray(v) for k, v in raw_chunk.items()}
-            else:
-                raw_chunk = np.ascontiguousarray(raw_chunk)
-                
+            # engine.process_chunk handles the dict or ndarray
             processed_chunk = self.engine.process_chunk(raw_chunk)
-            
+
             # 4. Handle channel mismatch (e.g., stereo stems on mono output)
             if processed_chunk.shape[0] != outdata.shape[1]:
                 if outdata.shape[1] == 1:
@@ -457,10 +467,11 @@ class GaiaTUI:
                     processed_chunk = np.tile(processed_chunk, (outdata.shape[1], 1))
                 else:
                     # Truncate or pad if they are both multi-channel but different
-                    new_chunk = np.zeros((outdata.shape[1], processed_chunk.shape[1]))
+                    mismatch_buf = self.engine._get_buffer("_mismatch_buf", (outdata.shape[1], processed_chunk.shape[1]))
+                    mismatch_buf.fill(0.0)
                     min_ch = min(outdata.shape[1], processed_chunk.shape[0])
-                    new_chunk[:min_ch, :] = processed_chunk[:min_ch, :]
-                    processed_chunk = new_chunk
+                    mismatch_buf[:min_ch, :] = processed_chunk[:min_ch, :]
+                    processed_chunk = mismatch_buf
 
             # 4.5 Apply invisible -1dB (-10.8% amplitude) output scaling to give stream headroom and prevent pipeline clipping
             headroom_multiplier = 10 ** (-1.0 / 20.0)
@@ -1737,42 +1748,6 @@ def main():
     parser.add_argument("--blocksize", type=int, default=512, help="Audio buffer block size (default: 512)")
     args = parser.parse_args()
 
-    audio_data, sr = None, 44100
-    if args.input_file:
-        try:
-            audio_data, sr = sf.read(args.input_file)
-            audio_data = np.ascontiguousarray(audio_data.T if audio_data.ndim > 1 else audio_data.reshape(1, -1))
-            tui.audio_data = audio_data
-            tui.sample_rate = sr
-            tui.current_filename = os.path.basename(args.input_file)
-            tui.engine = Engine(sample_rate=sr)
-            
-            # Auto-load stems if they exist in cache
-            cache_dir = os.path.join("STEM-CACHE", tui.current_filename, "htdemucs", os.path.splitext(tui.current_filename)[0])
-            if os.path.exists(cache_dir):
-                stem_names = ["vocals", "drums", "bass", "other"]
-                if all(os.path.exists(os.path.join(cache_dir, f"{s}.wav")) for s in stem_names):
-                    tui.stems_data = {}
-                    for s in stem_names:
-                        arr, stem_sr = sf.read(os.path.join(cache_dir, f"{s}.wav"))
-                        arr = arr.T
-
-                        if int(stem_sr) != int(tui.sample_rate):
-                            arr = librosa.resample(arr, orig_sr=stem_sr, target_sr=tui.sample_rate)
-
-                        # Ensure exact length match
-                        target_len = tui.audio_data.shape[1]
-                        if arr.shape[1] > target_len:
-                            arr = arr[:, :target_len]
-                        elif arr.shape[1] < target_len:
-                            pad = np.zeros((arr.shape[0], target_len - arr.shape[1]), dtype=arr.dtype)
-                            arr = np.concatenate([arr, pad], axis=1)
-
-                        tui.stems_data[s] = np.ascontiguousarray(arr)
-        except Exception as e:
-            print(f"Error loading {args.input_file}: {e}")
-            sys.exit(1)
-
     # Initialize a dummy population
     initial_mixes = [Mix(crossovers=[100.0, 500.0, 2500.0, 8000.0]) for _ in range(5)]
     
@@ -1780,7 +1755,10 @@ def main():
     initial_mixes[0].is_locked = True
 
     pop = Population(initial_mixes)
-    tui = GaiaTUI(pop, audio_data, sr, ".", blocksize=args.blocksize)
+    tui = GaiaTUI(pop, None, 44100, ".", blocksize=args.blocksize)
+
+    if args.input_file:
+        tui.load_audio(args.input_file)
 
     with TerminalMode() as term:
         # Use Rich Live to render the UI. Set auto_refresh=False to avoid background thread issues.

@@ -31,20 +31,27 @@ except (ImportError, ValueError):
 
 class HybridChain:
     """A DSP chain that can mix Pedalboard plugins and custom algorithmic modules."""
-    def __init__(self, modules, sample_rate: int):
+    def __init__(self, modules: List[Any], sample_rate: int):
+        self.modules = list(modules)
         self.processors = []
-        for m in modules:
+        for m in self.modules:
             plugin = m.get_plugin(sample_rate)
             if plugin:
                 self.processors.append(plugin)
             else:
                 self.processors.append(m)
                 
+    def update_parameters(self, sample_rate: int):
+        """Updates the parameters of all plugins in the chain in-place."""
+        for m, p in zip(self.modules, self.processors):
+            if p is not m:
+                m.update_plugin(p, sample_rate)
+
     def process(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         current_audio = audio
         for p in self.processors:
-            # Both pedalboard plugins and our AudioModules share the .process(audio, sr) signature
-            current_audio = p.process(current_audio, sample_rate)
+            # Both pedalboard plugins and our AudioModules share the .process(audio, sr, reset=False) signature
+            current_audio = p.process(current_audio, sample_rate, reset=False)
         return current_audio
 
 class Engine:
@@ -66,6 +73,25 @@ class Engine:
         self._band_states = [] # List of dicts: {'solo': bool, 'mute': bool, 'bypassed': bool, 'gain': float}
         self._post_state = {'soloed': False, 'muted': False, 'bypassed': False, 'gain': 1.0}
 
+        # Buffers for real-time safety
+        self._summed_buffer: Optional[np.ndarray] = None
+        self._temp_chunk_buffer: Optional[np.ndarray] = None
+        self._zero_buffer: Optional[np.ndarray] = None
+
+        # Safety limiter to prevent digital clipping
+        if pedalboard:
+            self._safety_limiter = pedalboard.Limiter(threshold_db=-0.1, release_ms=25.0)
+        else:
+            self._safety_limiter = None
+
+    def _get_buffer(self, attr_name: str, shape: tuple) -> np.ndarray:
+        """Helper to get or create a buffer of a specific shape."""
+        buf = getattr(self, attr_name)
+        if buf is None or buf.shape != shape:
+            buf = np.zeros(shape, dtype=np.float32)
+            setattr(self, attr_name, buf)
+        return buf
+
     def _compile_board(self, band_dna: Band) -> HybridChain:
         """Compiles an AudioModule chain into a HybridChain object."""
         return HybridChain(band_dna.modules, self.sample_rate)
@@ -74,19 +100,34 @@ class Engine:
         """Compiles the DSP state from the Mix DNA. Thread-safe."""
         with self.lock:
             # 0. Compile Stem bands
-            self._stem_boards = {}
-            self._stem_states = {}
+            new_stem_boards = {}
+            new_stem_states = {}
             for name, band in mix_dna.stem_bands.items():
-                self._stem_boards[name] = self._compile_board(band)
-                self._stem_states[name] = {
+                old_board = self._stem_boards.get(name)
+                # Check if topology is identical (same module types in same order)
+                if old_board and [type(m) for m in old_board.modules] == [type(m) for m in band.modules]:
+                    old_board.modules = list(band.modules) # Update module references to get new parameter values
+                    old_board.update_parameters(self.sample_rate)
+                    new_stem_boards[name] = old_board
+                else:
+                    new_stem_boards[name] = self._compile_board(band)
+                
+                new_stem_states[name] = {
                     'soloed': band.is_soloed,
                     'muted': band.is_muted,
                     'bypassed': getattr(band, 'is_bypassed', False),
                     'gain': 10 ** (band.gain.current_value / 20.0)
                 }
+            self._stem_boards = new_stem_boards
+            self._stem_states = new_stem_states
 
             # 1. Compile PRE band
-            self._pre_board = self._compile_board(mix_dna.pre_band)
+            if self._pre_board and [type(m) for m in self._pre_board.modules] == [type(m) for m in mix_dna.pre_band.modules]:
+                self._pre_board.modules = list(mix_dna.pre_band.modules)
+                self._pre_board.update_parameters(self.sample_rate)
+            else:
+                self._pre_board = self._compile_board(mix_dna.pre_band)
+                
             self._pre_state = {
                 'soloed': mix_dna.pre_band.is_soloed,
                 'muted': mix_dna.pre_band.is_muted,
@@ -95,19 +136,33 @@ class Engine:
             }
 
             # 2. Compile Parallel bands
-            self._band_boards = []
-            self._band_states = []
-            for band in mix_dna.bands:
-                self._band_boards.append(self._compile_board(band))
-                self._band_states.append({
+            new_band_boards = []
+            new_band_states = []
+            for i, band in enumerate(mix_dna.bands):
+                old_board = self._band_boards[i] if i < len(self._band_boards) else None
+                if old_board and [type(m) for m in old_board.modules] == [type(m) for m in band.modules]:
+                    old_board.modules = list(band.modules)
+                    old_board.update_parameters(self.sample_rate)
+                    new_band_boards.append(old_board)
+                else:
+                    new_band_boards.append(self._compile_board(band))
+                    
+                new_band_states.append({
                     'soloed': band.is_soloed,
                     'muted': band.is_muted,
                     'bypassed': getattr(band, 'is_bypassed', False),
                     'gain': 10 ** (band.gain.current_value / 20.0)
                 })
+            self._band_boards = new_band_boards
+            self._band_states = new_band_states
 
             # 3. Compile POST band
-            self._post_board = self._compile_board(mix_dna.post_band)
+            if self._post_board and [type(m) for m in self._post_board.modules] == [type(m) for m in mix_dna.post_band.modules]:
+                self._post_board.modules = list(mix_dna.post_band.modules)
+                self._post_board.update_parameters(self.sample_rate)
+            else:
+                self._post_board = self._compile_board(mix_dna.post_band)
+                
             self._post_state = {
                 'soloed': mix_dna.post_band.is_soloed,
                 'muted': mix_dna.post_band.is_muted,
@@ -131,14 +186,16 @@ class Engine:
             # 0. Stem Processing (if input is dict)
             if isinstance(input_chunk, dict):
                 if not input_chunk:
-                    return np.array([])
+                    return np.array([], dtype=np.float32)
                 
                 # Determine target shape from first stem
                 first_stem = next(iter(input_chunk.values()))
                 num_channels, num_samples = first_stem.shape
-                summed = np.zeros((num_channels, num_samples), dtype=np.float32)
                 
-                solo_active = any(self._stem_states[name]['soloed'] for name in input_chunk)
+                summed = self._get_buffer("_summed_buffer", (num_channels, num_samples))
+                summed.fill(0.0)
+                
+                solo_active = any(self._stem_states[name]['soloed'] for name in input_chunk if name in self._stem_states)
                 
                 for name, audio in input_chunk.items():
                     state = self._stem_states.get(name)
@@ -153,27 +210,34 @@ class Engine:
                     # Match length if necessary (pad or truncate)
                     chunk = audio
                     if chunk.shape[1] != num_samples:
+                        temp = self._get_buffer("_temp_chunk_buffer", (num_channels, num_samples))
+                        temp.fill(0.0)
                         if chunk.shape[1] > num_samples:
-                            chunk = chunk[:, :num_samples]
+                            temp[:] = chunk[:, :num_samples]
                         else:
-                            temp = np.zeros((num_channels, num_samples), dtype=np.float32)
                             temp[:, :chunk.shape[1]] = chunk
-                            chunk = temp
+                        chunk = temp
                     
                     # Process and sum
-                    # Empty pedalboard acts as a passthrough
                     processed = chunk if state.get('bypassed', False) else board.process(chunk, self.sample_rate)
-                    summed += processed * state['gain']
+                    
+                    # Add to sum with headroom scaling (nominal -6dB for internal mix)
+                    summed += processed * state['gain'] * 0.5
                 current_audio = summed
             else:
-                current_audio = input_chunk
+                # Direct input also gets headroom scaling
+                current_audio = input_chunk * 0.5
 
             if self._pre_board is None:
+                # Still apply safety limiter even if no FX
+                if self._safety_limiter:
+                    return self._safety_limiter.process(current_audio, self.sample_rate, reset=False)
                 return current_audio
 
-            # PRE Solo/Mute logic (Solo doesn't conceptually apply to master buses, but mute does)
+            # PRE Solo/Mute logic
             if self._pre_state['muted']:
-                current_audio = np.zeros_like(current_audio)
+                current_audio = self._get_buffer("_zero_buffer", current_audio.shape)
+                current_audio.fill(0.0)
             else:
                 # 1. PRE-FX and Gain
                 current_audio = current_audio if self._pre_state.get('bypassed', False) else self._pre_board.process(current_audio, self.sample_rate)
@@ -192,29 +256,43 @@ class Engine:
                 # Solo/Mute logic
                 if solo_active:
                     if not state['soloed']:
-                        processed_bands.append(np.zeros_like(band_audio))
+                        # Use a zeroed slice of the buffer instead of np.zeros_like
+                        zeros = self._get_buffer(f"_band_zero_{i}", band_audio.shape)
+                        zeros.fill(0.0)
+                        processed_bands.append(zeros)
                         continue
                 elif state['muted']:
-                    processed_bands.append(np.zeros_like(band_audio))
+                    zeros = self._get_buffer(f"_band_zero_{i}", band_audio.shape)
+                    zeros.fill(0.0)
+                    processed_bands.append(zeros)
                     continue
 
                 # Band-FX
                 processed_band = band_audio if state.get('bypassed', False) else self._band_boards[i].process(band_audio, self.sample_rate)
                 
                 # Band-Gain
-                processed_bands.append(processed_band * state['gain'])
+                if state['gain'] != 1.0:
+                    processed_band = processed_band * state['gain']
+                processed_bands.append(processed_band)
             
             # 4. Sum bands
             summed_audio = self._crossover.sum_bands(processed_bands)
 
             if self._post_state['muted']:
-                final_audio = np.zeros_like(summed_audio)
+                final_audio = self._get_buffer("_zero_buffer", summed_audio.shape)
+                final_audio.fill(0.0)
             else:
                 # 5. POST-FX and Gain
                 final_audio = summed_audio if self._post_state.get('bypassed', False) else self._post_board.process(summed_audio, self.sample_rate)
                 final_audio = final_audio * self._post_state['gain']
 
-            return final_audio
+            # 6. Final safety limiter (to catch any peaks from summing/gain)
+            if self._safety_limiter:
+                final_audio = self._safety_limiter.process(final_audio, self.sample_rate, reset=False)
+            
+            # Restore levels (bring -6dB nominal back up to near 0dB if safe)
+            # Actually, keeping some headroom is better. I'll use 1.8x to bring it back up significantly but not all the way to 2x (which was the 0.5 scaling)
+            return final_audio * 1.8
 
     def process(self, input_audio: Any, mix_dna: Mix) -> np.ndarray:
         """Processes audio (ndarray or dict of stems) through the Mix DNA."""
